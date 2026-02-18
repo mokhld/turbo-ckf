@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "turbo-ckf"
-version = "0.1.0"
+version = "0.1.1"
 description = "Turbo-CKF: High-performance Cubature Kalman Filter"
 authors = [{ name = "Mohammed Khalid" }]
 readme = "README.md"
