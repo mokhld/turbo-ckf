@@ -1,0 +1,17 @@
+[package]
+name = "turbo-ckf"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mohammed Khalid (@mokhld)"]
+license = "MIT OR Apache-2.0"
+description = "Turbo CKF Rust backend"
+
+[lib]
+name = "turbo_ckf_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.20", features = ["extension-module", "abi3-py39"] }
+numpy = "0.20"
+nalgebra = { version = "0.32", features = ["serde-serialize"] }
+rayon = "1.10"

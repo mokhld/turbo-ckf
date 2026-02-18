@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "turbo-ckf"
+version = "0.1.0"
+description = "Turbo-CKF: High-performance Cubature Kalman Filter"
+authors = [{ name = "Mohammed Khalid" }]
+readme = "README.md"
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.22"]
+
+[project.optional-dependencies]
+dev = [
+  "numpy",
+  "filterpy",
+  "pytest",
+  "pytest-benchmark",
+  "maturin",
+]
+
+[tool.maturin]
+module-name = "turbo_ckf._rust"
+python-source = "."
+features = ["pyo3/extension-module"]
