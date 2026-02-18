@@ -28,13 +28,17 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m venv .venv
+          . .venv/bin/activate
           python -m pip install --upgrade pip
           python -m pip install -r turbo_ckf/requirements-dev.txt
 
       - name: Build extension in env
         run: |
+          . .venv/bin/activate
           python -m maturin develop --release
 
       - name: Run tests
         run: |
+          . .venv/bin/activate
           PYTHONPATH=. python -m unittest discover -s turbo_ckf_tests -p 'test_*.py'
