@@ -1,6 +1,6 @@
 # turbo-ckf
 
-`turbo-ckf` is a Rust-backed Cubature Kalman Filter package for high-throughput prediction/update loops.
+`turbo-ckf` is a Rust-backed Cubature Kalman Filter package for high-throughput prediction/update loops. Implemented here purely as an experiment after reading the paper.
 
 ## What This Package Optimizes
 
