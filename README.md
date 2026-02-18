@@ -60,3 +60,5 @@ kf.update_paper_ahrs(z6, sigma_acc2=1e-2, sigma_mag2=1e-2)
 Dual-licensed under either:
 - MIT (`LICENSE-MIT`)
 - Apache-2.0 (`LICENSE-APACHE`)
+
+Release/publish process: `PUBLISHING.md`.

@@ -20,12 +20,19 @@ build/
 dist/
 pip-wheel-metadata/
 *.so
+*.pyd
+*.dll
+*.dylib
+turbo_ckf/_rust.*
 kckf.pdf
 
 # Rust/Cargo
 target/
 .cargo/
 .rustup/
+
+# Packaging credentials
+.pypirc
 
 # Benchmark cache
 .benchmarks/
