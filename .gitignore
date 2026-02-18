@@ -33,6 +33,7 @@ target/
 
 # Packaging credentials
 .pypirc
+PUBLISHING.md
 
 # Benchmark cache
 .benchmarks/
