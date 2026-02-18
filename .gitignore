@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Virtualenv
+.venv/
+.venv-turbo-ckf/
+.venv*/
+
+# Build artifacts
+build/
+dist/
+pip-wheel-metadata/
+*.so
+kckf.pdf
+
+# Rust/Cargo
+target/
+.cargo/
+.rustup/
+
+# Benchmark cache
+.benchmarks/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
