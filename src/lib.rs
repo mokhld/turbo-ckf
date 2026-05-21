@@ -945,9 +945,483 @@ fn batch_filter_linear<'py>(
     ))
 }
 
+// ----------------------------------------------------------------------------
+// Square-root Cubature Kalman Filter (SR-CKF)
+// ----------------------------------------------------------------------------
+//
+// Propagates the lower-triangular Cholesky factor `chol_p` (where
+// `chol_p * chol_p^T = P`) directly. The standard CKF in this crate calls
+// `stable_cholesky(P)` inside every `predict`/`update`, silently adding jitter
+// to the diagonal whenever P drifts toward non-positive-definite. The
+// square-root form never re-decomposes P during the filter loop: predict and
+// update both produce the next factor via QR + rank-1 Cholesky downdates, so
+// the "silent jitter" hazard at predict-time goes away entirely.
+//
+// References:
+//   Arasaratnam & Haykin, "Cubature Kalman Filters", IEEE TAC 54(6), 2009 —
+//   square-root variant (Algorithm 2).
+//   Van der Merwe (PhD thesis, 2004) — SR-UKF Algorithm 3.2; the CKF case is
+//   the symmetric-weight specialisation (no separate central-point update).
+
+#[pyclass]
+pub struct SquareRootCubatureKalmanFilter {
+    dim_x: usize,
+    dim_z: usize,
+    dt: f64,
+    x: DVector<f64>,
+    // Lower-triangular state-cov factor: chol_p * chol_p^T = P.
+    chol_p: DMatrix<f64>,
+    // Lower-triangular process-noise factor: chol_q * chol_q^T = Q.
+    chol_q: DMatrix<f64>,
+    // Lower-triangular measurement-noise factor: chol_r * chol_r^T = R.
+    chol_r: DMatrix<f64>,
+    // Innovation factor from the last update: s_innov * s_innov^T = S.
+    s_innov: DMatrix<f64>,
+    k: DMatrix<f64>,
+    y: DVector<f64>,
+    z: DVector<f64>,
+    x_prior: DVector<f64>,
+    chol_p_prior: DMatrix<f64>,
+    x_post: DVector<f64>,
+    chol_p_post: DMatrix<f64>,
+    z_pred: DVector<f64>,
+    log_likelihood: f64,
+    likelihood: f64,
+    mahalanobis: f64,
+    nis: f64,
+    // SR-CKF diagnostics. `jitter_count` is kept for API symmetry with the
+    // standard CKF, but the square-root path only invokes `stable_cholesky`
+    // when the user (re)seeds P / Q / R via `set_state` — never inside the
+    // filter loop. `downdate_fallback_count` increments when a rank-1
+    // Cholesky downdate of the posterior factor would produce a non-PD
+    // result and we fall back to a fresh Cholesky of the rebuilt P_post.
+    last_jitter: f64,
+    max_jitter: f64,
+    jitter_count: u64,
+    singular_innovation_count: u64,
+    downdate_fallback_count: u64,
+}
+
+#[pymethods]
+impl SquareRootCubatureKalmanFilter {
+    #[new]
+    fn new(dim_x: usize, dim_z: usize, dt: f64) -> PyResult<Self> {
+        if dim_x == 0 || dim_z == 0 {
+            return Err(PyValueError::new_err("dim_x and dim_z must be positive"));
+        }
+        if !dt.is_finite() {
+            return Err(PyValueError::new_err("dt must be finite"));
+        }
+        Ok(Self {
+            dim_x,
+            dim_z,
+            dt,
+            x: DVector::zeros(dim_x),
+            chol_p: DMatrix::identity(dim_x, dim_x),
+            chol_q: DMatrix::identity(dim_x, dim_x),
+            chol_r: DMatrix::identity(dim_z, dim_z),
+            s_innov: DMatrix::identity(dim_z, dim_z),
+            k: DMatrix::zeros(dim_x, dim_z),
+            y: DVector::zeros(dim_z),
+            z: DVector::zeros(dim_z),
+            x_prior: DVector::zeros(dim_x),
+            chol_p_prior: DMatrix::identity(dim_x, dim_x),
+            x_post: DVector::zeros(dim_x),
+            chol_p_post: DMatrix::identity(dim_x, dim_x),
+            z_pred: DVector::zeros(dim_z),
+            log_likelihood: f64::NAN,
+            likelihood: f64::NAN,
+            mahalanobis: f64::NAN,
+            nis: f64::NAN,
+            last_jitter: 0.0,
+            max_jitter: 0.0,
+            jitter_count: 0,
+            singular_innovation_count: 0,
+            downdate_fallback_count: 0,
+        })
+    }
+
+    /// Seed the filter from a covariance-space description.
+    ///
+    /// P, Q, R are accepted as full covariance matrices; their Cholesky
+    /// factors are computed once here via `stable_cholesky`. Any jitter that
+    /// had to be added at seeding time is recorded in the counters, but the
+    /// subsequent filter loop never touches `stable_cholesky` on P again —
+    /// so the typical predict-time jitter accumulation seen in the standard
+    /// CKF cannot happen.
+    #[pyo3(signature = (x, p, q, r))]
+    fn set_state(
+        &mut self,
+        x: PyReadonlyArray1<f64>,
+        p: PyReadonlyArray2<f64>,
+        q: PyReadonlyArray2<f64>,
+        r: PyReadonlyArray2<f64>,
+    ) -> PyResult<()> {
+        self.x = pyarray1_to_dvector(x, self.dim_x, "x")?;
+        let p_mat = pyarray2_to_dmatrix(p, self.dim_x, self.dim_x, "P")?;
+        let q_mat = pyarray2_to_dmatrix(q, self.dim_x, self.dim_x, "Q")?;
+        let r_mat = pyarray2_to_dmatrix(r, self.dim_z, self.dim_z, "R")?;
+        let (chol_p, jitter_p) = stable_cholesky(&p_mat)?;
+        let (chol_q, jitter_q) = stable_cholesky(&q_mat)?;
+        let (chol_r, jitter_r) = stable_cholesky(&r_mat)?;
+        self.chol_p = chol_p;
+        self.chol_q = chol_q;
+        self.chol_r = chol_r;
+        // Surface the worst seed-time jitter so callers can see if their
+        // P/Q/R were degenerate. We do NOT bump jitter_count for these —
+        // they're a one-shot cost at seeding, not the per-step silent
+        // jitter the standard CKF accumulates.
+        let worst = jitter_p.max(jitter_q).max(jitter_r);
+        if worst > self.last_jitter {
+            self.last_jitter = worst;
+        }
+        if worst > self.max_jitter {
+            self.max_jitter = worst;
+        }
+        Ok(())
+    }
+
+    #[pyo3(signature = (fx, dt=None, fx_args=None))]
+    fn predict_custom(
+        &mut self,
+        py: Python<'_>,
+        fx: PyObject,
+        dt: Option<f64>,
+        fx_args: Option<&PyTuple>,
+    ) -> PyResult<()> {
+        let local_dt = dt.unwrap_or(self.dt);
+        if !local_dt.is_finite() {
+            return Err(PyValueError::new_err("dt must be finite"));
+        }
+        let n = self.dim_x;
+        let sigma = cubature_points_from_factor(&self.x, &self.chol_p);
+        let args = fx_args.unwrap_or_else(|| PyTuple::empty(py));
+        let propagated = call_model_vectorized(py, &fx, &sigma, Some(local_dt), args, n)?;
+
+        let mean = row_mean(&propagated, n);
+        let w_sqrt = 1.0 / ((2 * n) as f64).sqrt();
+
+        // Stacked QR input M of shape (3n × n):
+        //   rows 0..2n : w_sqrt * (propagated_row_i - mean)
+        //   rows 2n..3n: rows of chol_q^T (i.e., columns of chol_q)
+        // M^T · M = empirical_cov + chol_q · chol_q^T = P_pred.
+        let mut m = DMatrix::<f64>::zeros(3 * n, n);
+        for i in 0..(2 * n) {
+            for j in 0..n {
+                m[(i, j)] = w_sqrt * (propagated[(i, j)] - mean[j]);
+            }
+        }
+        for row in 0..n {
+            for col in 0..n {
+                // Row `row` of chol_q^T == column `row` of chol_q == chol_q[(col, row)].
+                m[(2 * n + row, col)] = self.chol_q[(col, row)];
+            }
+        }
+
+        let chol_p_new = qr_to_lower_factor(m, n)?;
+        self.x = mean;
+        self.chol_p = chol_p_new;
+        self.x_prior = self.x.clone();
+        self.chol_p_prior = self.chol_p.clone();
+        Ok(())
+    }
+
+    /// Clear cached innovation / likelihood diagnostics. Used by the Python
+    /// wrapper when a measurement is skipped (`update(z=None)`), so callers
+    /// don't accidentally re-read stale values.
+    fn clear_update_diagnostics(&mut self) {
+        self.y = DVector::zeros(self.dim_z);
+        self.z = DVector::zeros(self.dim_z);
+        self.z_pred = DVector::zeros(self.dim_z);
+        self.s_innov = DMatrix::identity(self.dim_z, self.dim_z);
+        self.k = DMatrix::zeros(self.dim_x, self.dim_z);
+        self.log_likelihood = f64::NAN;
+        self.likelihood = f64::NAN;
+        self.mahalanobis = f64::NAN;
+        self.nis = f64::NAN;
+    }
+
+    fn reset_jitter_counters(&mut self) {
+        self.last_jitter = 0.0;
+        self.max_jitter = 0.0;
+        self.jitter_count = 0;
+        self.singular_innovation_count = 0;
+        self.downdate_fallback_count = 0;
+    }
+
+    #[pyo3(signature = (z, hx, r=None, hx_args=None))]
+    fn update(
+        &mut self,
+        py: Python<'_>,
+        z: PyReadonlyArray1<f64>,
+        hx: PyObject,
+        r: Option<PyReadonlyArray2<f64>>,
+        hx_args: Option<&PyTuple>,
+    ) -> PyResult<()> {
+        let n = self.dim_x;
+        let m_dim = self.dim_z;
+        let z_vec = pyarray1_to_dvector(z, m_dim, "z")?;
+        let chol_r_local = if let Some(mat) = r {
+            let r_mat = pyarray2_to_dmatrix(mat, m_dim, m_dim, "R")?;
+            let (chol_r, jitter) = stable_cholesky(&r_mat)?;
+            if jitter > 0.0 {
+                self.last_jitter = jitter;
+                if jitter > self.max_jitter {
+                    self.max_jitter = jitter;
+                }
+            }
+            chol_r
+        } else {
+            self.chol_r.clone()
+        };
+
+        let sigma = cubature_points_from_factor(&self.x, &self.chol_p);
+        let args = hx_args.unwrap_or_else(|| PyTuple::empty(py));
+        let z_sigma = call_model_vectorized(py, &hx, &sigma, None, args, m_dim)?;
+
+        let z_pred = row_mean(&z_sigma, m_dim);
+        let w_sqrt = 1.0 / ((2 * n) as f64).sqrt();
+
+        // Centred and weight-scaled sigma-point matrices.
+        let mut x_centered = DMatrix::<f64>::zeros(2 * n, n);
+        let mut z_centered = DMatrix::<f64>::zeros(2 * n, m_dim);
+        for i in 0..(2 * n) {
+            for j in 0..n {
+                x_centered[(i, j)] = w_sqrt * (sigma[(i, j)] - self.x[j]);
+            }
+            for j in 0..m_dim {
+                z_centered[(i, j)] = w_sqrt * (z_sigma[(i, j)] - z_pred[j]);
+            }
+        }
+
+        // QR of stacked [z_centered; chol_r^T] gives the innovation factor.
+        let mut m_zz = DMatrix::<f64>::zeros(2 * n + m_dim, m_dim);
+        for i in 0..(2 * n) {
+            for j in 0..m_dim {
+                m_zz[(i, j)] = z_centered[(i, j)];
+            }
+        }
+        for row in 0..m_dim {
+            for col in 0..m_dim {
+                m_zz[(2 * n + row, col)] = chol_r_local[(col, row)];
+            }
+        }
+        let s_innov = qr_to_lower_factor(m_zz, m_dim)?;
+
+        // Cross-cov: P_xz = X_centered^T · Z_centered  (n × m).
+        let p_xz = x_centered.tr_mul(&z_centered);
+
+        // Gain: K = P_xz · (S_innov · S_innov^T)^{-1}
+        //       K^T = (S_innov^T)^{-1} · S_innov^{-1} · P_xz^T
+        // Solve K^T in two triangular steps so we never form the inverse.
+        let mut kt = p_xz.transpose(); // (m × n)
+        if !s_innov.solve_lower_triangular_mut(&mut kt) {
+            self.singular_innovation_count = self.singular_innovation_count.saturating_add(1);
+            return Err(PyRuntimeError::new_err(
+                "SR-CKF innovation factor singular during gain solve",
+            ));
+        }
+        if !s_innov.tr_solve_lower_triangular_mut(&mut kt) {
+            self.singular_innovation_count = self.singular_innovation_count.saturating_add(1);
+            return Err(PyRuntimeError::new_err(
+                "SR-CKF innovation factor singular during gain solve",
+            ));
+        }
+        let k = kt.transpose(); // (n × m)
+
+        let y = &z_vec - &z_pred;
+        self.x = &self.x + &k * &y;
+
+        // Posterior factor via m sequential rank-1 Cholesky downdates:
+        //   chol_p_post · chol_p_post^T = chol_p · chol_p^T - U · U^T,
+        // where U = K · S_innov (n × m). If a downdate would break PD we
+        // fall back to rebuilding P_post explicitly and Cholesky-ing it.
+        let u = &k * &s_innov;
+        let mut chol_p_new = self.chol_p.clone();
+        let mut downdate_ok = true;
+        for col_idx in 0..m_dim {
+            let mut u_col = u.column(col_idx).clone_owned();
+            if cholesky_downdate(&mut chol_p_new, &mut u_col).is_err() {
+                downdate_ok = false;
+                break;
+            }
+        }
+        if downdate_ok {
+            self.chol_p = chol_p_new;
+        } else {
+            let p_old = &self.chol_p * self.chol_p.transpose();
+            let mut p_post = p_old - &u * u.transpose();
+            symmetrize_in_place(&mut p_post);
+            let (chol, jitter) = stable_cholesky(&p_post)?;
+            self.chol_p = chol;
+            if jitter > 0.0 {
+                self.last_jitter = jitter;
+                if jitter > self.max_jitter {
+                    self.max_jitter = jitter;
+                }
+                self.jitter_count = self.jitter_count.saturating_add(1);
+            }
+            self.downdate_fallback_count = self.downdate_fallback_count.saturating_add(1);
+        }
+
+        // Diagnostics. Mahalanobis² = ||S_innov^{-1} · y||².
+        let mut v = y.clone();
+        let mahal2 = if s_innov.solve_lower_triangular_mut(&mut v) {
+            v.dot(&v).max(0.0)
+        } else {
+            f64::NAN
+        };
+        let mut log_det = 0.0;
+        let mut log_det_ok = true;
+        for i in 0..m_dim {
+            let d = s_innov[(i, i)];
+            if !(d.is_finite() && d > 0.0) {
+                log_det_ok = false;
+                break;
+            }
+            log_det += d.ln();
+        }
+        log_det *= 2.0;
+        if log_det_ok && mahal2.is_finite() {
+            self.log_likelihood = -0.5 * ((m_dim as f64) * (2.0 * PI).ln() + log_det + mahal2);
+            self.likelihood = self.log_likelihood.exp();
+            self.nis = mahal2;
+            self.mahalanobis = mahal2.sqrt();
+        } else {
+            self.log_likelihood = f64::NEG_INFINITY;
+            self.likelihood = 0.0;
+            self.nis = f64::NAN;
+            self.mahalanobis = f64::NAN;
+        }
+
+        self.z = z_vec;
+        self.z_pred = z_pred;
+        self.k = k;
+        self.y = y;
+        self.s_innov = s_innov;
+        self.x_post = self.x.clone();
+        self.chol_p_post = self.chol_p.clone();
+        Ok(())
+    }
+
+    fn snapshot(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let out = PyDict::new(py);
+        let p = &self.chol_p * self.chol_p.transpose();
+        let p_prior = &self.chol_p_prior * self.chol_p_prior.transpose();
+        let p_post = &self.chol_p_post * self.chol_p_post.transpose();
+        let q = &self.chol_q * self.chol_q.transpose();
+        let r = &self.chol_r * self.chol_r.transpose();
+        let s = &self.s_innov * self.s_innov.transpose();
+        out.set_item("x", self.x.as_slice().to_pyarray(py))?;
+        out.set_item("chol_P", dmatrix_to_pyarray(py, &self.chol_p)?)?;
+        out.set_item("P", dmatrix_to_pyarray(py, &p)?)?;
+        out.set_item("chol_Q", dmatrix_to_pyarray(py, &self.chol_q)?)?;
+        out.set_item("Q", dmatrix_to_pyarray(py, &q)?)?;
+        out.set_item("chol_R", dmatrix_to_pyarray(py, &self.chol_r)?)?;
+        out.set_item("R", dmatrix_to_pyarray(py, &r)?)?;
+        out.set_item("K", dmatrix_to_pyarray(py, &self.k)?)?;
+        out.set_item("y", self.y.as_slice().to_pyarray(py))?;
+        out.set_item("z", self.z.as_slice().to_pyarray(py))?;
+        out.set_item("S", dmatrix_to_pyarray(py, &s)?)?;
+        out.set_item("S_innov", dmatrix_to_pyarray(py, &self.s_innov)?)?;
+        out.set_item("x_prior", self.x_prior.as_slice().to_pyarray(py))?;
+        out.set_item("P_prior", dmatrix_to_pyarray(py, &p_prior)?)?;
+        out.set_item("x_post", self.x_post.as_slice().to_pyarray(py))?;
+        out.set_item("P_post", dmatrix_to_pyarray(py, &p_post)?)?;
+        out.set_item("z_pred", self.z_pred.as_slice().to_pyarray(py))?;
+        out.set_item("log_likelihood", self.log_likelihood)?;
+        out.set_item("likelihood", self.likelihood)?;
+        out.set_item("mahalanobis", self.mahalanobis)?;
+        out.set_item("nis", self.nis)?;
+        out.set_item("last_jitter", self.last_jitter)?;
+        out.set_item("max_jitter", self.max_jitter)?;
+        out.set_item("jitter_count", self.jitter_count)?;
+        out.set_item("singular_innovation_count", self.singular_innovation_count)?;
+        out.set_item("downdate_fallback_count", self.downdate_fallback_count)?;
+        Ok(out.to_object(py))
+    }
+}
+
+#[inline]
+fn cubature_points_from_factor(x: &DVector<f64>, chol_p: &DMatrix<f64>) -> DMatrix<f64> {
+    let n = x.nrows();
+    let scale = (n as f64).sqrt();
+    let mut sigma = DMatrix::<f64>::zeros(2 * n, n);
+    for k in 0..n {
+        for j in 0..n {
+            let offset = scale * chol_p[(j, k)];
+            sigma[(k, j)] = x[j] + offset;
+            sigma[(n + k, j)] = x[j] - offset;
+        }
+    }
+    sigma
+}
+
+/// Given M of shape (k, n) with k >= n, return a lower-triangular S (n × n)
+/// satisfying `S · S^T = M^T · M`. Computed via QR; the diagonal of S is
+/// normalised non-negative for a canonical factor.
+fn qr_to_lower_factor(m: DMatrix<f64>, n: usize) -> PyResult<DMatrix<f64>> {
+    if m.nrows() < n {
+        return Err(PyRuntimeError::new_err(
+            "qr_to_lower_factor requires at least n rows",
+        ));
+    }
+    let qr = m.qr();
+    let r_full = qr.r();
+    let mut s = DMatrix::<f64>::zeros(n, n);
+    for i in 0..n {
+        for j in 0..=i {
+            s[(i, j)] = r_full[(j, i)];
+        }
+    }
+    for j in 0..n {
+        if s[(j, j)] < 0.0 {
+            for i in j..n {
+                s[(i, j)] = -s[(i, j)];
+            }
+        }
+    }
+    Ok(s)
+}
+
+/// Cholesky rank-1 downdate via hyperbolic Givens-style rotations.
+///
+/// Modifies the lower-triangular `l` in place such that the new factor
+/// satisfies `l_new · l_new^T = l · l^T - x · x^T`. `x` is consumed (mutated)
+/// to drive the rotation sequence; callers should clone the column they pass
+/// in if they need the original later.
+///
+/// Returns Err if the downdate would produce a non-PD matrix (i.e., x has
+/// non-trivial energy in the column space of `l`, so the result wouldn't be
+/// a real Cholesky factor). Callers should fall back to rebuilding P and
+/// taking a fresh Cholesky in that case.
+fn cholesky_downdate(l: &mut DMatrix<f64>, x: &mut DVector<f64>) -> Result<(), ()> {
+    let n = l.nrows();
+    for i in 0..n {
+        let lii = l[(i, i)];
+        let xi = x[i];
+        let r_sq = lii * lii - xi * xi;
+        if !r_sq.is_finite() || r_sq <= 0.0 {
+            return Err(());
+        }
+        let r = r_sq.sqrt();
+        let c = lii / r;
+        let s = xi / r;
+        l[(i, i)] = r;
+        for j in (i + 1)..n {
+            let lji = l[(j, i)];
+            let xj = x[j];
+            l[(j, i)] = c * lji - s * xj;
+            x[j] = -s * lji + c * xj;
+        }
+    }
+    Ok(())
+}
+
 #[pymodule]
 fn _rust(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<CubatureKalmanFilter>()?;
+    m.add_class::<SquareRootCubatureKalmanFilter>()?;
     m.add_function(wrap_pyfunction!(rts_smooth, m)?)?;
     m.add_function(wrap_pyfunction!(batch_filter_linear, m)?)?;
     Ok(())

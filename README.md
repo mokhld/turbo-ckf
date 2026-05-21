@@ -19,6 +19,18 @@
 
 `predict(...)` and `update(...)` also run through Rust, but callback cost in Python can dominate if your models are heavy.
 
+## Square-Root Variant
+
+`TurboSRCKF` is a separate estimator that propagates the lower-triangular Cholesky factor of `P` directly. The filter loop never calls `stable_cholesky` on `P`, so the silent diagonal-jitter accumulation `TurboCKF` surfaces via `jitter_count` is structurally impossible in steady state. Use it when `P` becomes ill-conditioned (e.g., long predict chains with tiny `Q`/`R`, or rank-deficient seed covariances). Mirrors `predict(...)` + `update(...)`; for closed-form linear predicts or the AHRS update use `TurboCKF`.
+
+```python
+from turbo_ckf import TurboSRCKF
+kf = TurboSRCKF(dim_x=4, dim_z=2, dt=0.1, hx=hx_vectorized, fx=fx_vectorized)
+kf.predict()
+kf.update(z)
+# kf.chol_P is the lower-triangular factor; kf.P = chol_P @ chol_P.T
+```
+
 ## Callback Contract
 
 Custom `fx` and `hx` must be vectorized:
