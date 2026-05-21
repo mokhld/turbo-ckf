@@ -363,6 +363,100 @@ class TurboCKF:
         return kf
 
     @staticmethod
+    def batch_filter(
+        x0: npt.ArrayLike,
+        P0: npt.ArrayLike,
+        zs: npt.ArrayLike,
+        F: npt.ArrayLike,
+        H: npt.ArrayLike,
+        Q: npt.ArrayLike | None = None,
+        R: npt.ArrayLike | None = None,
+    ) -> tuple[Matrix, np.ndarray, Vector]:
+        """Linear Kalman batch filter — one Rust-side pass over ``zs``.
+
+        Runs the full predict/update loop inside the backend so per-step
+        Python ↔ Rust crossings disappear. For the standard linear case
+        this is the order-of-magnitude path the audit called out.
+
+        ``F``, ``H``, ``Q``, ``R`` may be either constant matrices or
+        per-step arrays with leading dimension ``N``. Per-step inputs
+        match the contract that ``rts_smooth`` consumes, so a
+        forward-then-backward pass is one composed call away.
+
+        For nonlinear ``fx`` / ``hx``, use the per-step ``predict()`` /
+        ``update()`` API on a :class:`TurboCKF` instance.
+
+        Args:
+            x0: initial state, shape ``(dim_x,)``.
+            P0: initial covariance, shape ``(dim_x, dim_x)``.
+            zs: observations, shape ``(N, dim_z)``.
+            F: transition, shape ``(dim_x, dim_x)`` or
+                ``(N, dim_x, dim_x)``.
+            H: measurement, shape ``(dim_z, dim_x)`` or
+                ``(N, dim_z, dim_x)``.
+            Q: process noise, shape ``(dim_x, dim_x)`` or
+                ``(N, dim_x, dim_x)``. Defaults to zeros.
+            R: measurement noise, shape ``(dim_z, dim_z)`` or
+                ``(N, dim_z, dim_z)``. Defaults to identity.
+
+        Returns:
+            ``(xs, Ps, log_likelihoods)`` of shapes ``(N, dim_x)``,
+            ``(N, dim_x, dim_x)``, ``(N,)``.
+        """
+
+        x0_arr = np.ascontiguousarray(np.asarray(x0, dtype=float)).reshape(-1)
+        p0_arr = np.ascontiguousarray(np.asarray(P0, dtype=float))
+        zs_arr = np.ascontiguousarray(np.asarray(zs, dtype=float))
+        if zs_arr.ndim != 2:
+            raise ValueError(
+                f"zs must be 2D with shape (N, dim_z); got ndim={zs_arr.ndim}"
+            )
+        n, dim_z = zs_arr.shape
+        dim_x = x0_arr.shape[0]
+        if dim_x == 0:
+            raise ValueError("x0 must have at least one element")
+        if n == 0:
+            raise ValueError("zs must contain at least one observation")
+        if p0_arr.shape != (dim_x, dim_x):
+            raise ValueError(
+                f"P0 must have shape ({dim_x}, {dim_x}); got {p0_arr.shape}"
+            )
+
+        def _broadcast(name: str, value: npt.ArrayLike, inner: tuple[int, ...]) -> np.ndarray:
+            arr = np.ascontiguousarray(np.asarray(value, dtype=float))
+            if arr.ndim == 2:
+                if arr.shape != inner:
+                    raise ValueError(
+                        f"{name} must have shape {inner} or ({n}, *{inner}); got {arr.shape}"
+                    )
+                return np.ascontiguousarray(np.broadcast_to(arr, (n,) + inner))
+            if arr.ndim == 3:
+                if arr.shape != (n,) + inner:
+                    raise ValueError(
+                        f"{name} must have shape {inner} or ({n}, *{inner}); got {arr.shape}"
+                    )
+                return arr
+            raise ValueError(
+                f"{name} must be 2D or 3D; got ndim={arr.ndim}"
+            )
+
+        fs = _broadcast("F", F, (dim_x, dim_x))
+        hs = _broadcast("H", H, (dim_z, dim_x))
+        qs = _broadcast(
+            "Q", Q if Q is not None else np.zeros((dim_x, dim_x)), (dim_x, dim_x)
+        )
+        rs = _broadcast(
+            "R", R if R is not None else np.eye(dim_z), (dim_z, dim_z)
+        )
+
+        xs, Ps, lls = _rust.batch_filter_linear(x0_arr, p0_arr, zs_arr, fs, hs, qs, rs)
+        return (
+            np.asarray(xs, dtype=float),
+            np.asarray(Ps, dtype=float),
+            np.asarray(lls, dtype=float),
+        )
+
+    @staticmethod
     def rts_smooth(
         xs: npt.ArrayLike,
         Ps: npt.ArrayLike,
