@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-21
+
+### Added
+- `TurboCKF.enable_adaptive_noise(window=30, mode="R", alpha=0.3,
+  diagonal_floor=1e-12)` — opt-in Sage-Husa adaptive estimation of `R`
+  (canonical, innovation-based) and/or `Q` (heuristic, state-correction
+  outer-product with a documented stability caveat). After a `window`-step
+  warm-up, each successful `update(z=...)` folds the new innovation into a
+  running exponentially-weighted estimate and writes it back to `self.R`
+  (and/or `self.Q`) before the next step. Tracks Q/R drift over long runs
+  without the user having to retune by hand.
+- `TurboCKF.disable_adaptive_noise()` and the read-only
+  `TurboCKF.adaptive_noise_estimator` property for introspection /
+  diagnostics. The estimator state (running estimates, sample count,
+  configured `window`/`mode`/`alpha`) is carried through
+  `TurboCKF.copy()` and `TurboCKF.to_dict()` / `from_dict()`; `reset()`
+  drops it.
+- New private estimator class `turbo_ckf.core._AdaptiveNoiseEstimator`
+  containing the math (kept in Python so `copy()` / `to_dict()` round-trip
+  state for free and the formulation stays inspectable).
+- `turbo_ckf_tests/test_adaptive_noise.py`: 11 tests covering
+  (1) default-OFF guarantee — no behavioral change vs the 0.6.0 surface,
+  (2) `R` convergence to ~21% relative error vs a true `R = 4 × initial_R`
+  in 500 steps with adaptive enabled (gate set at 25%),
+  (3) time-averaged NIS pulled toward chi-squared mean for `dim_z`,
+  (4) 10k-step PSD/symmetry invariants with adaptive `R` running,
+  (5) `mode="both"` stability with conservative `alpha`,
+  (6) `copy()` / `to_dict()` / `from_dict()` carry estimator state,
+  (7) input validation (bad `window`, bad `alpha`, bad `mode`),
+  (8) direct unit tests of the warm-up gate and diagonal-floor clamp.
+
+### Notes
+- Default is OFF: callers that don't invoke `enable_adaptive_noise()` see
+  identical behaviour to v0.6.0; all 80 prior tests stay green with zero
+  modification.
+- Scope deliberately kept to the per-step `update(z=...)` path. The
+  `update_paper_ahrs` path overwrites `R` from `sigma_acc2`/`sigma_mag2`
+  each call (an adaptive write would be discarded); the estimator skips
+  there. The `batch_filter` / `batch_parallel_step` static methods carry
+  their own Rust-side `R` and are not affected by the per-instance
+  adaptive state — adaptive batch paths would require moving the
+  estimator into Rust, deferred to a later session.
+- Q-channel is a heuristic (`K · y · y^T · K^T`) and not unbiased under
+  arbitrary dynamics. The docstring flags this and recommends keeping
+  `alpha` small + verifying NEES on a held-out trajectory; the diagonal
+  floor keeps `Q` PD even when the contribution drifts.
+
 ## [0.6.0] - 2026-05-21
 
 ### Added
@@ -222,7 +269,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - KCKF-style AHRS update path from Yamagishi and Jing (arXiv:2602.12283).
 - Parity tests against FilterPy and benchmark scripts.
 
-[Unreleased]: https://github.com/mokhld/turbo-ckf/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/mokhld/turbo-ckf/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/mokhld/turbo-ckf/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/mokhld/turbo-ckf/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mokhld/turbo-ckf/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mokhld/turbo-ckf/compare/v0.3.0...v0.4.0
