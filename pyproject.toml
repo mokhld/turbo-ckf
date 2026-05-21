@@ -4,11 +4,12 @@ build-backend = "maturin"
 
 [project]
 name = "turbo-ckf"
-version = "0.1.1"
+version = "0.2.0"
 description = "Turbo-CKF: High-performance Cubature Kalman Filter"
 authors = [{ name = "Mohammed Khalid" }]
 readme = "README.md"
-license = { text = "MIT OR Apache-2.0" }
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
 requires-python = ">=3.9"
 dependencies = ["numpy>=1.22"]
 keywords = ["kalman-filter", "cubature-kalman-filter", "sensor-fusion", "rust", "python"]
@@ -24,6 +25,7 @@ classifiers = [
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Programming Language :: Rust",
   "Topic :: Scientific/Engineering",
 ]
@@ -46,3 +48,4 @@ Issues = "https://github.com/mokhld/turbo-ckf/issues"
 module-name = "turbo_ckf._rust"
 python-source = "."
 features = ["pyo3/extension-module"]
+include = ["turbo_ckf/py.typed"]
