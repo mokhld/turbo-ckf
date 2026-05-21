@@ -1,5 +1,10 @@
 # turbo-ckf
 
+[![PyPI version](https://img.shields.io/pypi/v/turbo-ckf.svg)](https://pypi.org/project/turbo-ckf/)
+[![Python versions](https://img.shields.io/pypi/pyversions/turbo-ckf.svg)](https://pypi.org/project/turbo-ckf/)
+[![CI](https://github.com/mokhld/turbo-ckf/actions/workflows/ci.yml/badge.svg)](https://github.com/mokhld/turbo-ckf/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 `turbo-ckf` is a Rust-backed Cubature Kalman Filter package for high-throughput prediction/update loops. Implemented here purely as an experiment after reading the paper.
 
 ## What This Package Optimizes
@@ -24,7 +29,15 @@ Custom `fx` and `hx` must be vectorized:
 
 If you pass pointwise callbacks, `TurboCKF` raises immediately.
 
-## Install (Local Dev)
+## Install
+
+```bash
+pip install turbo-ckf
+```
+
+Wheels are published for CPython 3.9 - 3.13 on Linux, macOS, and Windows.
+
+## Install from source (development)
 
 From `turbo-ckf/`:
 
