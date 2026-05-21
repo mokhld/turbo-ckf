@@ -90,6 +90,31 @@ has shifted. Search the new code with the diagnostic name if you want to verify.
   suppressed crate-wide with a documented `#![allow(...)]` (the upstream
   fix requires bumping to a newer PyO3, which is out of scope).
 
+**Session 6 (2026-05-21, shipped as v0.7.0):**
+- Adaptive measurement-noise (and optional process-noise) estimation
+  landed as an opt-in capability on `TurboCKF`. The new
+  `enable_adaptive_noise(window, mode, alpha)` method turns on a
+  Sage-Husa exponentially-weighted estimator that folds each post-update
+  innovation into a running estimate of `R` (and/or `Q`). After a
+  configurable warm-up window the current estimate is written back to
+  `self.R` / `self.Q` on every step, so the filter tracks Q/R drift
+  without the user having to retune. Closes audit feature item #4
+  ("Adaptive Q/R — Sage-Husa / IAE / RAE"). Estimator math lives in
+  Python (`turbo_ckf.core._AdaptiveNoiseEstimator`) so `copy()` /
+  `to_dict()` / `from_dict()` round-trip the running state for free.
+  R is the canonical innovation-based form (`E[y y^T + R - S]`,
+  unbiased in steady state); Q is the state-correction heuristic
+  (`E[K y y^T K^T]`) with a diagonal floor + docstring warning to keep
+  `alpha` small. Default is OFF — all 80 prior tests stay green
+  unchanged. Verified by (1) ~21% relative error on adaptive R after 500
+  CV-trajectory steps where the true R is 4x the initial R (gate set at
+  25%); (2) time-averaged NIS ≈ 1.09 for `dim_z = 1` (chi-square mean 1)
+  vs baseline NIS ≈ 4.14 with the wrong initial R; (3) 10k-step PSD /
+  symmetry invariants under adaptive R; (4) `mode="both"` stability with
+  conservative `alpha`. 11 new tests added (91 total). Scope kept to the
+  per-step `update(z=...)` path — batch paths would require a Rust-side
+  estimator; deferred.
+
 **Session 5 (2026-05-21, shipped as v0.6.0):**
 - Parallel batch predict+update path
   (`turbo_ckf.batch_parallel_step` / `TurboCKF.batch_parallel_step`)
@@ -152,10 +177,11 @@ has shifted. Search the new code with the diagnostic name if you want to verify.
 **Deferred (still open from the audit):**
 - Nonlinear parallel batch step via Python `fx`/`hx` callbacks (Session 5
   covered the linear path only — callbacks would serialize on the GIL;
-  needs a pure-Rust callback contract). Adaptive Q/R, multi-rate
-  updates, additional standard models (CTRV/CTRA/Singer). Square-root
-  CKF for the standard-model and AHRS paths (Session 4 covered
-  `predict_custom` + `update` only).
+  needs a pure-Rust callback contract). Adaptive Q/R for the batch
+  paths (Session 6 shipped per-step adaptive only; batch paths would
+  need a Rust-side estimator). Multi-rate updates, additional standard
+  models (CTRV/CTRA/Singer). Square-root CKF for the standard-model and
+  AHRS paths (Session 4 covered `predict_custom` + `update` only).
 - `quaternion omega_cross` sign convention vs paper Eq. (3) — needs an
   actual hardware-trajectory cross-check, not just code review.
 - Cross-backend benchmark vs Numba/JAX.
