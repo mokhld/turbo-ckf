@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-21
+
+### Added
+- `TurboCKF.rts_smooth(xs, Ps, Fs, Qs)` Rauch-Tung-Striebel fixed-interval
+  smoother, backed by a new Rust `turbo_ckf._rust.rts_smooth` free function.
+  Per-step `Fs`/`Qs` accept either length `N` (FilterPy-compatible — last
+  entry unused) or length `N-1`, so non-constant transitions are handled
+  natively without callbacks. Re-exported as `turbo_ckf.rts_smooth`.
+- `turbo_ckf_tests/test_rts_smoother.py`: forward-filter-then-smooth on a
+  canonical linear-Gaussian constant-velocity trajectory, asserting at
+  least a 30% drop in position RMSE versus the forward-only estimate, plus
+  endpoint-equality, single-step identity, length-`N` vs length-`N-1`
+  agreement, non-constant `F` handling, shape-validation rejections, and
+  the `TurboCKF.rts_smooth` static-method form.
+
 ## [0.2.0] - 2026-05-21
 
 ### Added
@@ -99,7 +114,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - KCKF-style AHRS update path from Yamagishi and Jing (arXiv:2602.12283).
 - Parity tests against FilterPy and benchmark scripts.
 
-[Unreleased]: https://github.com/mokhld/turbo-ckf/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/mokhld/turbo-ckf/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/mokhld/turbo-ckf/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mokhld/turbo-ckf/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/mokhld/turbo-ckf/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/mokhld/turbo-ckf/releases/tag/v0.1.0

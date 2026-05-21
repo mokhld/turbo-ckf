@@ -90,8 +90,17 @@ has shifted. Search the new code with the diagnostic name if you want to verify.
   suppressed crate-wide with a documented `#![allow(...)]` (the upstream
   fix requires bumping to a newer PyO3, which is out of scope).
 
+**Session 2 (2026-05-21, shipped as v0.3.0):**
+- RTS smoother (`turbo_ckf.rts_smooth` / `TurboCKF.rts_smooth`) landed as a
+  Rust-backed batch routine that accepts `(xs, Ps, Fs, Qs)`. Per-step
+  `Fs`/`Qs` (length `N` FilterPy-style or `N-1`) handle non-constant
+  transitions natively. Backward-pass `P_pred` inversion reuses the
+  Cholesky-with-fallback path from `invert_innovation`. Verified by a
+  canonical linear-Gaussian CV trajectory where smoothing cuts position
+  RMSE by well over 30% vs the forward filter.
+
 **Deferred (still open from the audit):**
-- RTS smoother, square-root CKF, batched filtering with rayon, adaptive
+- Square-root CKF, batched filtering with rayon, adaptive
   Q/R, multi-rate updates, additional standard models (CTRV/CTRA/Singer).
 - `quaternion omega_cross` sign convention vs paper Eq. (3) — needs an
   actual hardware-trajectory cross-check, not just code review.
