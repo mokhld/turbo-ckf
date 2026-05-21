@@ -13,6 +13,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use pyo3::wrap_pyfunction;
+use rayon::prelude::*;
 use std::f64::consts::PI;
 
 #[pyclass]
@@ -946,6 +947,267 @@ fn batch_filter_linear<'py>(
 }
 
 // ----------------------------------------------------------------------------
+// Parallel batch step: many filters, one observation each
+// ----------------------------------------------------------------------------
+//
+// Distinct from `batch_filter_linear` (one filter, many observations). Here
+// we have a bank of M independent linear Kalman filters that share the same
+// F/H/Q/R, each with its own (x, P), and each gets a single observation
+// z_i. The M filter steps are executed in parallel via rayon. The GIL is
+// released for the duration of the parallel section so worker threads don't
+// serialize on Python state.
+//
+// Use cases: Monte-Carlo banks, particle filters, multi-target tracking
+// where each target rides on the same dynamics + measurement model.
+//
+// Status code semantics (parallel-safe, no panics, no raise):
+//   0 = ok, innovation covariance was PD (Cholesky succeeded)
+//   1 = singular_innovation, fell back to pseudo-inverse for S
+//   2 = failed, no inverse at all — state stays at the predict-step output
+//       (no measurement update applied) and ll = -inf
+//
+// The linear path never touches `stable_cholesky` on P, so the jitter
+// surface that the per-step path exposes via snapshot() does not apply.
+
+/// Linear-step inversion helper that does not allocate via PyResult. Returns
+/// (S^-1, status) where status mirrors the public contract of
+/// batch_parallel_step. None means even the pseudo-inverse failed.
+fn invert_innovation_noraise(s: &DMatrix<f64>) -> (Option<DMatrix<f64>>, i64) {
+    if let Some(chol) = s.clone().cholesky() {
+        return (Some(chol.inverse()), 0);
+    }
+    if let Some(inv) = s.clone().try_inverse() {
+        return (Some(inv), 1);
+    }
+    if let Ok(pinv) = s.clone().svd(true, true).pseudo_inverse(1e-12) {
+        return (Some(pinv), 1);
+    }
+    (None, 2)
+}
+
+/// Cholesky log-det of a (presumed) PD matrix. Returns None if a diagonal
+/// entry is non-positive or non-finite.
+fn cholesky_log_det(s: &DMatrix<f64>) -> Option<f64> {
+    let chol = s.clone().cholesky()?;
+    let l = chol.l();
+    let mut log_det = 0.0;
+    for i in 0..l.nrows() {
+        let d = l[(i, i)];
+        if d <= 0.0 || !d.is_finite() {
+            return None;
+        }
+        log_det += d.ln();
+    }
+    Some(2.0 * log_det)
+}
+
+/// One predict + linear update step for a single (x, P) against observation
+/// z. All shared matrices (F, H, Q, R, I) and constants are passed by
+/// reference. Returns (x_new, P_new, log_likelihood, status). Allocations
+/// are deliberately local so this is callable from within `par_iter`.
+#[allow(clippy::too_many_arguments)]
+fn linear_predict_update_step(
+    x_in: &DVector<f64>,
+    p_in: &DMatrix<f64>,
+    z: &DVector<f64>,
+    f: &DMatrix<f64>,
+    f_t: &DMatrix<f64>,
+    h: &DMatrix<f64>,
+    h_t: &DMatrix<f64>,
+    q: &DMatrix<f64>,
+    r: &DMatrix<f64>,
+    eye_x: &DMatrix<f64>,
+    log_two_pi: f64,
+    dim_z: usize,
+) -> (DVector<f64>, DMatrix<f64>, f64, i64) {
+    // Predict
+    let x_pred = f * x_in;
+    let mut p_pred = f * p_in * f_t + q;
+    symmetrize_in_place(&mut p_pred);
+
+    // Innovation
+    let z_pred = h * &x_pred;
+    let y = z - &z_pred;
+    let mut s = h * &p_pred * h_t + r;
+    symmetrize_in_place(&mut s);
+
+    let (si_opt, status) = invert_innovation_noraise(&s);
+    let si = match si_opt {
+        Some(m) => m,
+        None => {
+            // No update applied — return predict-step state.
+            return (x_pred, p_pred, f64::NEG_INFINITY, status);
+        }
+    };
+
+    let k_gain = &p_pred * h_t * &si;
+    let x_new = &x_pred + &k_gain * &y;
+    let i_kh = eye_x - &k_gain * h;
+    let mut p_new = &i_kh * &p_pred * i_kh.transpose() + &k_gain * r * k_gain.transpose();
+    symmetrize_in_place(&mut p_new);
+
+    let mahal2 = (y.transpose() * &si * &y)[(0, 0)].max(0.0);
+    let ll = if let Some(log_det) = cholesky_log_det(&s) {
+        -0.5 * ((dim_z as f64) * log_two_pi + log_det + mahal2)
+    } else {
+        f64::NEG_INFINITY
+    };
+
+    (x_new, p_new, ll, status)
+}
+
+/// Parallel batch step: M independent linear KFs sharing F, H, Q, R; each
+/// has its own (x_i, P_i) and a single observation z_i.
+///
+/// Inputs:
+///   xs: (M, dim_x)
+///   ps: (M, dim_x, dim_x)
+///   zs: (M, dim_z)
+///   f:  (dim_x, dim_x)
+///   h:  (dim_z, dim_x)
+///   q:  (dim_x, dim_x)
+///   r:  (dim_z, dim_z)
+///
+/// Returns (xs_new, ps_new, log_likelihoods, status) with shapes
+/// (M, dim_x), (M, dim_x, dim_x), (M,), (M,). Status code per filter:
+///   0 = ok, 1 = singular_innovation fallback, 2 = no update applied.
+#[pyfunction]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn batch_parallel_step<'py>(
+    py: Python<'py>,
+    xs: PyReadonlyArray2<f64>,
+    ps: PyReadonlyArray3<f64>,
+    zs: PyReadonlyArray2<f64>,
+    f: PyReadonlyArray2<f64>,
+    h: PyReadonlyArray2<f64>,
+    q: PyReadonlyArray2<f64>,
+    r: PyReadonlyArray2<f64>,
+) -> PyResult<(
+    &'py PyArray2<f64>,
+    &'py PyArray3<f64>,
+    &'py PyArray1<f64>,
+    &'py PyArray1<i64>,
+)> {
+    let xs_arr = xs.as_array();
+    let ps_arr = ps.as_array();
+    let zs_arr = zs.as_array();
+    let f_arr = f.as_array();
+    let h_arr = h.as_array();
+    let q_arr = q.as_array();
+    let r_arr = r.as_array();
+
+    let xs_shape = xs_arr.shape();
+    if xs_shape.len() != 2 {
+        return Err(PyValueError::new_err("xs must be 2D with shape (M, dim_x)"));
+    }
+    let m = xs_shape[0];
+    let dim_x = xs_shape[1];
+    if m == 0 {
+        return Err(PyValueError::new_err("xs must contain at least one filter"));
+    }
+    if dim_x == 0 {
+        return Err(PyValueError::new_err("dim_x must be positive"));
+    }
+
+    let zs_shape = zs_arr.shape();
+    if zs_shape[0] != m {
+        return Err(PyValueError::new_err(format!(
+            "zs must have leading dimension {m}; got {}",
+            zs_shape[0]
+        )));
+    }
+    let dim_z = zs_shape[1];
+    if dim_z == 0 {
+        return Err(PyValueError::new_err("dim_z must be positive"));
+    }
+
+    let ps_shape = ps_arr.shape();
+    if ps_shape != [m, dim_x, dim_x] {
+        return Err(PyValueError::new_err(format!(
+            "Ps must have shape ({m}, {dim_x}, {dim_x}); got ({}, {}, {})",
+            ps_shape[0], ps_shape[1], ps_shape[2]
+        )));
+    }
+    let check_2d = |name: &str, sh: &[usize], a: usize, b: usize| -> PyResult<()> {
+        if sh[0] != a || sh[1] != b {
+            return Err(PyValueError::new_err(format!(
+                "{name} must have shape ({a}, {b}); got ({}, {})",
+                sh[0], sh[1]
+            )));
+        }
+        Ok(())
+    };
+    check_2d("F", f_arr.shape(), dim_x, dim_x)?;
+    check_2d("H", h_arr.shape(), dim_z, dim_x)?;
+    check_2d("Q", q_arr.shape(), dim_x, dim_x)?;
+    check_2d("R", r_arr.shape(), dim_z, dim_z)?;
+
+    // Copy inputs out of Python-owned storage so we can drop the GIL.
+    let f_mat = DMatrix::from_fn(dim_x, dim_x, |r, c| f_arr[[r, c]]);
+    let h_mat = DMatrix::from_fn(dim_z, dim_x, |r, c| h_arr[[r, c]]);
+    let q_mat = DMatrix::from_fn(dim_x, dim_x, |r, c| q_arr[[r, c]]);
+    let r_mat = DMatrix::from_fn(dim_z, dim_z, |r, c| r_arr[[r, c]]);
+    let f_t = f_mat.transpose();
+    let h_t = h_mat.transpose();
+    let eye_x = DMatrix::<f64>::identity(dim_x, dim_x);
+
+    let mut xs_in: Vec<DVector<f64>> = Vec::with_capacity(m);
+    let mut ps_in: Vec<DMatrix<f64>> = Vec::with_capacity(m);
+    let mut zs_in: Vec<DVector<f64>> = Vec::with_capacity(m);
+    for i in 0..m {
+        xs_in.push(DVector::from_iterator(
+            dim_x,
+            (0..dim_x).map(|j| xs_arr[[i, j]]),
+        ));
+        ps_in.push(DMatrix::from_fn(dim_x, dim_x, |r, c| ps_arr[[i, r, c]]));
+        zs_in.push(DVector::from_iterator(
+            dim_z,
+            (0..dim_z).map(|j| zs_arr[[i, j]]),
+        ));
+    }
+
+    let log_two_pi = (2.0 * PI).ln();
+
+    // Run the bank in parallel with the GIL released.
+    let results: Vec<(DVector<f64>, DMatrix<f64>, f64, i64)> = py.allow_threads(|| {
+        (0..m)
+            .into_par_iter()
+            .map(|i| {
+                linear_predict_update_step(
+                    &xs_in[i], &ps_in[i], &zs_in[i], &f_mat, &f_t, &h_mat, &h_t, &q_mat, &r_mat,
+                    &eye_x, log_two_pi, dim_z,
+                )
+            })
+            .collect()
+    });
+
+    let mut xs_out = numpy::ndarray::Array2::<f64>::zeros((m, dim_x));
+    let mut ps_out = numpy::ndarray::Array3::<f64>::zeros((m, dim_x, dim_x));
+    let mut ll_out = numpy::ndarray::Array1::<f64>::zeros(m);
+    let mut status_out = numpy::ndarray::Array1::<i64>::zeros(m);
+
+    for (i, (x_new, p_new, ll, status)) in results.into_iter().enumerate() {
+        for j in 0..dim_x {
+            xs_out[[i, j]] = x_new[j];
+        }
+        for r in 0..dim_x {
+            for c in 0..dim_x {
+                ps_out[[i, r, c]] = p_new[(r, c)];
+            }
+        }
+        ll_out[i] = ll;
+        status_out[i] = status;
+    }
+
+    Ok((
+        xs_out.to_pyarray(py),
+        ps_out.to_pyarray(py),
+        ll_out.to_pyarray(py),
+        status_out.to_pyarray(py),
+    ))
+}
+
+// ----------------------------------------------------------------------------
 // Square-root Cubature Kalman Filter (SR-CKF)
 // ----------------------------------------------------------------------------
 //
@@ -1424,5 +1686,6 @@ fn _rust(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<SquareRootCubatureKalmanFilter>()?;
     m.add_function(wrap_pyfunction!(rts_smooth, m)?)?;
     m.add_function(wrap_pyfunction!(batch_filter_linear, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_parallel_step, m)?)?;
     Ok(())
 }

@@ -12,11 +12,13 @@ from .paper_ahrs import (
 
 rts_smooth = TurboCKF.rts_smooth
 batch_filter = TurboCKF.batch_filter
+batch_parallel_step = TurboCKF.batch_parallel_step
 
 __all__ = [
     "TurboCKF",
     "TurboSRCKF",
     "batch_filter",
+    "batch_parallel_step",
     "rts_smooth",
     "magnetic_reference_terms",
     "measurement_noise",
