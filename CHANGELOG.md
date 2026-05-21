@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-21
+
+### Added
+- `TurboCKF.batch_filter(x0, P0, zs, F, H, Q=None, R=None)` linear Kalman
+  batch filter, backed by a new Rust `turbo_ckf._rust.batch_filter_linear`
+  free function. Single Rust-side loop with Joseph-form posterior, runs
+  the full predict/update sequence without crossing Python on each step.
+  Returns `(xs, Ps, log_likelihoods)` directly consumable by
+  `rts_smooth` — no reshape between forward and backward passes.
+  Per-step `F`/`H`/`Q`/`R` (leading dimension `N`) or constants are both
+  accepted; constants are broadcast in Python. Re-exported as
+  `turbo_ckf.batch_filter`.
+- `turbo_ckf_tests/test_batch_filter.py`: 8 tests including a tight
+  numerical-parity check against a sequential `predict_linear_model` +
+  `update` loop (~1e-9 agreement on state, covariance, and log-
+  likelihood), a `batch_filter → rts_smooth` composition test on a
+  CV trajectory, constant-vs-tiled broadcast equivalence, defaults
+  (Q=0, R=I), per-step F handling, log-likelihood sanity, and shape
+  rejections.
+
+### Performance
+- 10,000-step linear CV filter: 118 ms sequential (Python ↔ Rust per
+  step) → 5.3 ms via `batch_filter` — **~22x speedup** on M-class
+  Apple silicon, validating the audit's "order of magnitude" target.
+
 ## [0.3.0] - 2026-05-21
 
 ### Added
@@ -114,7 +139,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - KCKF-style AHRS update path from Yamagishi and Jing (arXiv:2602.12283).
 - Parity tests against FilterPy and benchmark scripts.
 
-[Unreleased]: https://github.com/mokhld/turbo-ckf/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/mokhld/turbo-ckf/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/mokhld/turbo-ckf/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mokhld/turbo-ckf/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mokhld/turbo-ckf/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/mokhld/turbo-ckf/compare/v0.1.0...v0.1.1
