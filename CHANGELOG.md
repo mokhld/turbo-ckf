@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-21
+
+### Added
+- `TurboSRCKF` — Square-Root Cubature Kalman Filter, a new estimator class
+  alongside `TurboCKF`. Propagates the lower-triangular Cholesky factor of
+  P directly instead of P itself. Predict step uses a single QR of the
+  stacked weighted sigma-point deltas with `chol(Q)`; update uses one QR
+  for the innovation factor plus per-measurement-dim rank-1 Cholesky
+  downdates for the posterior factor. The filter loop never calls
+  `stable_cholesky` on P, so the silent diagonal-jitter accumulation that
+  `TurboCKF` reports via `jitter_count` is structurally impossible in
+  steady state — the new `downdate_fallback_count` diagnostic surfaces
+  the rare extreme-conditioning case where a rank-1 downdate would break
+  PD and we have to rebuild P_post explicitly. Mirrors the
+  `predict_custom` + `update` surface from `TurboCKF`; standard-model
+  predict paths and the paper AHRS update stay on `TurboCKF`. Re-exported
+  as `turbo_ckf.TurboSRCKF`.
+- New Rust class `turbo_ckf._rust.SquareRootCubatureKalmanFilter` backing
+  the wrapper. Exposes `set_state`, `predict_custom`, `update`,
+  `clear_update_diagnostics`, `reset_jitter_counters`, and `snapshot`.
+  Snapshot includes `chol_P`, `chol_Q`, `chol_R`, `S_innov`, the derived
+  `P` / `Q` / `R` / `S`, and the full diagnostics surface
+  (`last_jitter`, `max_jitter`, `jitter_count`,
+  `singular_innovation_count`, `downdate_fallback_count`).
+- `turbo_ckf_tests/test_sr_ckf.py`: 8 tests covering (1) ~1e-8 parity vs
+  `TurboCKF` on a 60-step linear-Gaussian CV trajectory and a 200-step
+  pure-predict chain; (2) ill-conditioned trajectory (rank-deficient
+  initial P with eigenvalue ratio ~1e18 + tiny R) where `TurboCKF` must
+  add jitter via `stable_cholesky` while `TurboSRCKF.jitter_count` stays
+  at zero; (3) snapshot factor-consistency (`chol_P · chol_P^T == P`),
+  skipped-update diagnostic clearing, constructor validation, reset, and
+  chi-square gating.
+
+### Notes
+- Why a separate class vs a backend flag on `TurboCKF`: the struct state
+  is genuinely different (a factor, not a covariance), so a flag would
+  have meant two code paths through every existing predict variant +
+  update + AHRS method, putting all 62 prior tests at risk. The separate
+  class keeps the opt-in clean and preserves the existing surface
+  unchanged.
+
 ## [0.4.0] - 2026-05-21
 
 ### Added
@@ -139,7 +180,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - KCKF-style AHRS update path from Yamagishi and Jing (arXiv:2602.12283).
 - Parity tests against FilterPy and benchmark scripts.
 
-[Unreleased]: https://github.com/mokhld/turbo-ckf/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/mokhld/turbo-ckf/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/mokhld/turbo-ckf/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mokhld/turbo-ckf/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mokhld/turbo-ckf/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mokhld/turbo-ckf/compare/v0.1.1...v0.2.0
