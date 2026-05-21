@@ -6,10 +6,11 @@
 #![allow(non_local_definitions)]
 
 use nalgebra::{DMatrix, DVector};
-use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
+use numpy::{PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, ToPyArray};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
+use pyo3::wrap_pyfunction;
 use std::f64::consts::PI;
 
 #[pyclass]
@@ -677,8 +678,123 @@ fn dmatrix_to_pyarray<'py>(py: Python<'py>, mat: &DMatrix<f64>) -> PyResult<&'py
     Ok(arr.to_pyarray(py))
 }
 
+/// Rauch-Tung-Striebel fixed-interval smoother.
+///
+/// Inputs are the forward-filtered trace:
+///   xs: (N, dim_x)              -- filtered state means x_{k|k}
+///   ps: (N, dim_x, dim_x)       -- filtered covariances P_{k|k}
+///   fs: (N or N-1, dim_x, dim_x) -- per-step transition F_k (maps k -> k+1)
+///   qs: (N or N-1, dim_x, dim_x) -- per-step process-noise Q_k
+///
+/// When fs/qs are passed with length N (FilterPy convention) the last entry
+/// is unused. Per-step matrices let the smoother handle non-constant
+/// transitions without callbacks.
+///
+/// Returns (xs_smooth, Ps_smooth) of the same shapes as (xs, ps). The inverse
+/// of the one-step-predicted covariance uses the same Cholesky-with-fallback
+/// path as the filter's innovation inversion, so smoothing won't blow up on
+/// a numerically borderline predicted covariance.
+#[pyfunction]
+fn rts_smooth<'py>(
+    py: Python<'py>,
+    xs: PyReadonlyArray2<f64>,
+    ps: PyReadonlyArray3<f64>,
+    fs: PyReadonlyArray3<f64>,
+    qs: PyReadonlyArray3<f64>,
+) -> PyResult<(&'py PyArray2<f64>, &'py PyArray3<f64>)> {
+    let xs_arr = xs.as_array();
+    let ps_arr = ps.as_array();
+    let fs_arr = fs.as_array();
+    let qs_arr = qs.as_array();
+
+    let n = xs_arr.shape()[0];
+    let dim_x = xs_arr.shape()[1];
+    if n == 0 {
+        return Err(PyValueError::new_err(
+            "xs must contain at least one filtered state",
+        ));
+    }
+    if dim_x == 0 {
+        return Err(PyValueError::new_err(
+            "xs second dimension must be positive",
+        ));
+    }
+    let p_shape = ps_arr.shape();
+    if p_shape[0] != n || p_shape[1] != dim_x || p_shape[2] != dim_x {
+        return Err(PyValueError::new_err(format!(
+            "Ps must have shape ({n}, {dim_x}, {dim_x}), got ({}, {}, {})",
+            p_shape[0], p_shape[1], p_shape[2]
+        )));
+    }
+    let need_steps = n.saturating_sub(1);
+    for (name, a) in [("Fs", fs_arr.shape()), ("Qs", qs_arr.shape())] {
+        let len_ok = a[0] == n || a[0] == need_steps;
+        if !len_ok || a[1] != dim_x || a[2] != dim_x {
+            return Err(PyValueError::new_err(format!(
+                "{name} must have shape (N, {dim_x}, {dim_x}) or (N-1, {dim_x}, {dim_x}); got ({}, {}, {})",
+                a[0], a[1], a[2]
+            )));
+        }
+    }
+
+    // Pull traces into nalgebra once.
+    let mut xs_smooth: Vec<DVector<f64>> = (0..n)
+        .map(|i| DVector::from_iterator(dim_x, (0..dim_x).map(|j| xs_arr[[i, j]])))
+        .collect();
+    let mut ps_smooth: Vec<DMatrix<f64>> = (0..n)
+        .map(|i| DMatrix::from_fn(dim_x, dim_x, |r, c| ps_arr[[i, r, c]]))
+        .collect();
+
+    // Snapshot filtered values (we overwrite xs_smooth / ps_smooth backwards).
+    let xs_filt: Vec<DVector<f64>> = xs_smooth.clone();
+    let ps_filt: Vec<DMatrix<f64>> = ps_smooth.clone();
+
+    if n >= 2 {
+        for k in (0..n - 1).rev() {
+            let f_k = DMatrix::from_fn(dim_x, dim_x, |r, c| fs_arr[[k, r, c]]);
+            let q_k = DMatrix::from_fn(dim_x, dim_x, |r, c| qs_arr[[k, r, c]]);
+
+            let x_filt_k = &xs_filt[k];
+            let p_filt_k = &ps_filt[k];
+
+            let x_pred = &f_k * x_filt_k;
+            let mut p_pred = &f_k * p_filt_k * f_k.transpose() + &q_k;
+            symmetrize_in_place(&mut p_pred);
+
+            let (p_pred_inv, _was_singular) = invert_innovation(&p_pred)?;
+            let c_k = p_filt_k * f_k.transpose() * &p_pred_inv;
+
+            let x_next_smooth = &xs_smooth[k + 1];
+            let p_next_smooth = &ps_smooth[k + 1];
+
+            let x_new = x_filt_k + &c_k * (x_next_smooth - &x_pred);
+            let mut p_new = p_filt_k + &c_k * (p_next_smooth - &p_pred) * c_k.transpose();
+            symmetrize_in_place(&mut p_new);
+
+            xs_smooth[k] = x_new;
+            ps_smooth[k] = p_new;
+        }
+    }
+
+    // Pack back into numpy buffers (one allocation per output).
+    let mut xs_out = numpy::ndarray::Array2::<f64>::zeros((n, dim_x));
+    let mut ps_out = numpy::ndarray::Array3::<f64>::zeros((n, dim_x, dim_x));
+    for i in 0..n {
+        for j in 0..dim_x {
+            xs_out[[i, j]] = xs_smooth[i][j];
+        }
+        for r in 0..dim_x {
+            for c in 0..dim_x {
+                ps_out[[i, r, c]] = ps_smooth[i][(r, c)];
+            }
+        }
+    }
+    Ok((xs_out.to_pyarray(py), ps_out.to_pyarray(py)))
+}
+
 #[pymodule]
 fn _rust(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<CubatureKalmanFilter>()?;
+    m.add_function(wrap_pyfunction!(rts_smooth, m)?)?;
     Ok(())
 }
