@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-21
+
+### Added
+- `TurboCKF.batch_parallel_step(xs, Ps, zs, F, H, Q=None, R=None)` — parallel
+  linear predict+update over a bank of `M` independent Kalman filters that
+  share `(F, H, Q, R)`. Each filter has its own `(x_i, P_i)` and a single
+  observation `z_i`; the `M` filter steps run in parallel via `rayon` with
+  the GIL released. Distinct from `batch_filter` ("one filter, many
+  observations") — this is the "many filters, one observation each"
+  pattern used in Monte-Carlo banks, particle filters, and multi-target
+  tracking. Activates the previously-unused `rayon` dependency.
+- Returns `(xs_new, Ps_new, log_likelihoods, status)`. `status[i]` reports
+  per-filter health: `0` ok, `1` singular innovation (pseudo-inverse used),
+  `2` no inverse at all (measurement update skipped, ll = `-inf`). One
+  failing filter does not abort the bank — Monte-Carlo callers can mask
+  on `status` and continue.
+- New Rust free function `turbo_ckf._rust.batch_parallel_step` backing the
+  wrapper, with a non-`PyResult` `invert_innovation_noraise` helper so
+  per-filter failure can be reported as a status code instead of an
+  exception that would abort the whole bank.
+- `turbo_ckf_tests/test_batch_parallel_step.py`: 6 tests covering ~1e-10
+  state + covariance + log-likelihood parity vs a sequential per-step
+  reference loop on `M=100`; shape/dtype/defaults/rejection-of-bad-shapes
+  coverage; per-filter error handling (singular `S` in one filter does
+  not break the others); and a perf gate enforcing `>= 4x` speedup over
+  the sequential Rust per-step loop on `M=10,000`.
+- Re-exported as `turbo_ckf.batch_parallel_step`.
+
+### Performance
+- Bank of `M=10,000` 4-state filters with a 2D linear measurement: the
+  sequential Rust per-step loop takes ~125 ms; one parallel step takes
+  ~1.8 ms — **~70x speedup** on M-class Apple silicon (8 performance
+  cores plus per-filter parallelism amortizing FFI / Python overhead).
+  The audit's "at least 4x" target is well exceeded.
+
+### Notes
+- Scope deliberately kept to the linear path (`predict_linear_model` +
+  linear measurement update). Nonlinear `predict_custom` / cubature-
+  update via Python `fx` / `hx` callbacks would serialize on the GIL
+  during every callback — defer to a later session with a pure-Rust
+  callback contract.
+
 ## [0.5.0] - 2026-05-21
 
 ### Added
@@ -180,7 +222,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - KCKF-style AHRS update path from Yamagishi and Jing (arXiv:2602.12283).
 - Parity tests against FilterPy and benchmark scripts.
 
-[Unreleased]: https://github.com/mokhld/turbo-ckf/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/mokhld/turbo-ckf/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/mokhld/turbo-ckf/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mokhld/turbo-ckf/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mokhld/turbo-ckf/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mokhld/turbo-ckf/compare/v0.2.0...v0.3.0
