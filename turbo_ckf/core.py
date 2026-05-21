@@ -20,6 +20,169 @@ except Exception as exc:  # pragma: no cover
 
 _STANDARD_MODELS = tuple(_rust.CubatureKalmanFilter.supported_standard_models())
 
+_ADAPTIVE_MODES = ("R", "Q", "both")
+
+
+class _AdaptiveNoiseEstimator:
+    """Sage-Husa style adaptive Q/R estimator.
+
+    Maintains an exponentially-weighted moving average of the per-step
+    measurement (and optionally process) noise contribution inferred from the
+    filter's innovation. After a configurable ``window``-step warm-up the
+    estimator writes its current estimate back to the filter's ``R`` (and/or
+    ``Q``) covariance on each successful update.
+
+    R-channel uses the canonical innovation-based relation
+    ``R_est = E[y y^T + R - S]``; in steady state this is unbiased even while
+    the filter is still adapting because ``E[y y^T] = H P_prior H^T + R_true``
+    and ``E[S] = H P_prior H^T + R_filter``.
+
+    Q-channel uses the state-correction heuristic
+    ``Q_est = E[K y y^T K^T]``. This is *not* an unbiased Q estimator and can
+    destabilize the filter if used aggressively; callers opting into ``mode in
+    ("Q", "both")`` should keep ``alpha`` small and verify NEES on a held-out
+    trajectory.
+    """
+
+    __slots__ = (
+        "window",
+        "mode",
+        "alpha",
+        "diagonal_floor",
+        "dim_x",
+        "dim_z",
+        "_estimate_R",
+        "_estimate_Q",
+        "_count",
+        "_adapt_R",
+        "_adapt_Q",
+    )
+
+    def __init__(
+        self,
+        window: int,
+        mode: str,
+        alpha: float,
+        dim_x: int,
+        dim_z: int,
+        diagonal_floor: float = 1e-12,
+    ) -> None:
+        window = int(window)
+        alpha = float(alpha)
+        if window < 1:
+            raise ValueError("adaptive window must be at least 1")
+        if not (0.0 < alpha <= 1.0):
+            raise ValueError("alpha must be in (0, 1]")
+        if mode not in _ADAPTIVE_MODES:
+            raise ValueError(
+                f"mode must be one of {_ADAPTIVE_MODES!r}; got {mode!r}"
+            )
+        if not (diagonal_floor > 0.0 and np.isfinite(diagonal_floor)):
+            raise ValueError("diagonal_floor must be finite and positive")
+
+        self.window = window
+        self.mode = mode
+        self.alpha = alpha
+        self.diagonal_floor = float(diagonal_floor)
+        self.dim_x = int(dim_x)
+        self.dim_z = int(dim_z)
+        self._estimate_R = np.zeros((self.dim_z, self.dim_z), dtype=float)
+        self._estimate_Q = np.zeros((self.dim_x, self.dim_x), dtype=float)
+        self._count = 0
+        self._adapt_R = mode in ("R", "both")
+        self._adapt_Q = mode in ("Q", "both")
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    @property
+    def warmed_up(self) -> bool:
+        return self._count >= self.window
+
+    def estimate_R(self) -> Matrix:
+        return self._estimate_R.copy()
+
+    def estimate_Q(self) -> Matrix:
+        return self._estimate_Q.copy()
+
+    def step(
+        self,
+        y: Vector,
+        S: Matrix,
+        R_current: Matrix,
+        K: Matrix,
+    ) -> tuple[Matrix | None, Matrix | None]:
+        """Fold one innovation/update into the running estimate.
+
+        Returns ``(new_R, new_Q)``. Either entry is ``None`` if (a) that
+        channel is disabled, or (b) the estimator is still in the warm-up
+        window (``count < window``).
+        """
+
+        outer_y = np.outer(y, y)
+        contrib_R = outer_y + R_current - S
+        if self._adapt_R:
+            self._update_running(self._estimate_R, contrib_R)
+        if self._adapt_Q:
+            contrib_Q = K @ outer_y @ K.T
+            self._update_running(self._estimate_Q, contrib_Q)
+
+        self._count += 1
+
+        new_R: Matrix | None = None
+        new_Q: Matrix | None = None
+        if self._count >= self.window:
+            if self._adapt_R:
+                new_R = self._clamp_pd(self._estimate_R)
+            if self._adapt_Q:
+                new_Q = self._clamp_pd(self._estimate_Q)
+        return new_R, new_Q
+
+    def _update_running(self, target: Matrix, contrib: Matrix) -> None:
+        # In-place EWMA so callers see the running estimate via estimate_R()/Q().
+        contrib_sym = 0.5 * (contrib + contrib.T)
+        if self._count == 0:
+            np.copyto(target, contrib_sym)
+        else:
+            target *= 1.0 - self.alpha
+            target += self.alpha * contrib_sym
+
+    def _clamp_pd(self, mat: Matrix) -> Matrix:
+        out = 0.5 * (mat + mat.T)
+        diag = np.maximum(np.diagonal(out), self.diagonal_floor)
+        # np.diagonal returns a read-only view; reconstruct.
+        np.fill_diagonal(out, diag)
+        return out
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "window": self.window,
+            "mode": self.mode,
+            "alpha": self.alpha,
+            "diagonal_floor": self.diagonal_floor,
+            "dim_x": self.dim_x,
+            "dim_z": self.dim_z,
+            "estimate_R": self._estimate_R.copy(),
+            "estimate_Q": self._estimate_Q.copy(),
+            "count": self._count,
+        }
+
+    @classmethod
+    def from_state(cls, state: Mapping[str, Any]) -> "_AdaptiveNoiseEstimator":
+        est = cls(
+            window=int(state["window"]),
+            mode=str(state["mode"]),
+            alpha=float(state["alpha"]),
+            dim_x=int(state["dim_x"]),
+            dim_z=int(state["dim_z"]),
+            diagonal_floor=float(state.get("diagonal_floor", 1e-12)),
+        )
+        est._estimate_R = np.array(state["estimate_R"], dtype=float, copy=True)
+        est._estimate_Q = np.array(state["estimate_Q"], dtype=float, copy=True)
+        est._count = int(state["count"])
+        return est
+
 
 class TurboCKF:
     """Rust-backed Cubature Kalman Filter.
@@ -79,6 +242,10 @@ class TurboCKF:
         self.max_jitter: float = 0.0
         self.jitter_count: int = 0
         self.singular_innovation_count: int = 0
+
+        # Adaptive Q/R estimator. None when disabled (the default); set via
+        # enable_adaptive_noise().
+        self._adaptive: _AdaptiveNoiseEstimator | None = None
 
         self._rust_backend = _rust.CubatureKalmanFilter(self.dim_x, self.dim_z, self.dt)
         self._backend_name = "rust"
@@ -192,6 +359,7 @@ class TurboCKF:
             args,
         )
         self._pull_state_from_backend()
+        self._apply_adaptive_noise()
         return self.x
 
     def update_paper_ahrs(
@@ -214,6 +382,90 @@ class TurboCKF:
         return self.x
 
     # ----- diagnostics / utility ------------------------------------------
+
+    def enable_adaptive_noise(
+        self,
+        window: int = 30,
+        mode: str = "R",
+        alpha: float = 0.3,
+        diagonal_floor: float = 1e-12,
+    ) -> None:
+        """Turn on Sage-Husa adaptive R (and/or Q) estimation.
+
+        After each successful ``update(z=...)`` call, folds the new
+        innovation into a running EWMA estimate of the measurement-noise
+        covariance ``R`` (and/or process-noise covariance ``Q``). For the
+        first ``window`` updates, only the estimator state is built up — the
+        filter's ``R``/``Q`` are left untouched. From step ``window`` onward,
+        the current estimate is written back to ``self.R`` (and/or
+        ``self.Q``) before the next predict/update.
+
+        Off by default. Existing per-step behaviour and all existing tests
+        are unaffected when this is not called.
+
+        Args:
+            window: warm-up step count. The estimator accumulates this many
+                innovations before writing the first update back to
+                ``R``/``Q``. Setting this larger trades adaptation latency
+                for less noise in the initial estimate. Default 30.
+            mode: which noise covariance to adapt. One of ``"R"`` (canonical
+                — innovation-based, unbiased in steady state),
+                ``"Q"`` (heuristic — state-correction outer-product; can
+                destabilize, keep ``alpha`` small and verify NEES on a
+                held-out trajectory), or ``"both"``. Default ``"R"``.
+            alpha: EWMA forgetting factor in ``(0, 1]``. Larger values track
+                changes faster but produce noisier estimates. Typical
+                ``0.01..0.3``. Default ``0.3``.
+            diagonal_floor: lower bound clamped onto the diagonal of every
+                estimate write-back, keeping the adaptive covariances
+                positive-definite. Default ``1e-12``.
+
+        Notes:
+            - Adaptive estimation runs on the standard ``update(z=...)``
+              path only. ``update_paper_ahrs`` overwrites ``R`` from its
+              ``sigma_acc2``/``sigma_mag2`` arguments on every call, so the
+              adaptive R-write would be discarded; the estimator is
+              skipped there.
+            - The ``batch_filter`` / ``batch_parallel_step`` paths use
+              their own Rust-side ``R``; adaptive noise is per-instance
+              and does not affect those static-method calls.
+        """
+
+        self._adaptive = _AdaptiveNoiseEstimator(
+            window=window,
+            mode=mode,
+            alpha=alpha,
+            dim_x=self.dim_x,
+            dim_z=self.dim_z,
+            diagonal_floor=diagonal_floor,
+        )
+
+    def disable_adaptive_noise(self) -> None:
+        """Turn adaptive R/Q estimation off and drop the estimator state."""
+
+        self._adaptive = None
+
+    @property
+    def adaptive_noise_estimator(self) -> _AdaptiveNoiseEstimator | None:
+        """Read-only handle to the current adaptive estimator (or ``None``)."""
+
+        return self._adaptive
+
+    def _apply_adaptive_noise(self) -> None:
+        if self._adaptive is None:
+            return
+        if not (np.all(np.isfinite(self.y)) and np.all(np.isfinite(self.S))):
+            return
+        new_R, new_Q = self._adaptive.step(
+            y=self.y,
+            S=self.S,
+            R_current=self.R,
+            K=self.K,
+        )
+        if new_R is not None:
+            self.R = new_R
+        if new_Q is not None:
+            self.Q = new_Q
 
     def gate(self, threshold: float) -> bool:
         """Chi-square gating decision on the most recent innovation.
@@ -261,6 +513,11 @@ class TurboCKF:
         self.max_jitter = 0.0
         self.jitter_count = 0
         self.singular_innovation_count = 0
+        # Drop adaptive estimator state on reset — Q/R are back to defaults so
+        # an existing accumulator would carry stale evidence into a fresh run.
+        # Estimator config (window/mode/alpha) is forgotten too; users that
+        # want it back should re-call enable_adaptive_noise() after reset().
+        self._adaptive = None
         # Rebuild the backend to drop its accumulated counters too.
         self._rust_backend = _rust.CubatureKalmanFilter(self.dim_x, self.dim_z, self.dt)
         self._push_state_to_backend()
@@ -292,6 +549,8 @@ class TurboCKF:
         new.max_jitter = self.max_jitter
         new.jitter_count = self.jitter_count
         new.singular_innovation_count = self.singular_innovation_count
+        if self._adaptive is not None:
+            new._adaptive = _AdaptiveNoiseEstimator.from_state(self._adaptive.to_state())
         new._push_state_to_backend()
         return new
 
@@ -303,7 +562,7 @@ class TurboCKF:
         ndarrays). Callbacks are *not* included — restoring requires the
         caller to re-supply them via :meth:`from_dict`."""
 
-        return {
+        out = {
             "version": 1,
             "dim_x": self.dim_x,
             "dim_z": self.dim_z,
@@ -324,6 +583,9 @@ class TurboCKF:
             "max_jitter": self.max_jitter,
             "singular_innovation_count": self.singular_innovation_count,
         }
+        if self._adaptive is not None:
+            out["adaptive"] = self._adaptive.to_state()
+        return out
 
     @classmethod
     def from_dict(
@@ -359,6 +621,9 @@ class TurboCKF:
         kf.jitter_count = int(state.get("jitter_count", 0))
         kf.max_jitter = float(state.get("max_jitter", 0.0))
         kf.singular_innovation_count = int(state.get("singular_innovation_count", 0))
+        adaptive_state = state.get("adaptive")
+        if adaptive_state is not None:
+            kf._adaptive = _AdaptiveNoiseEstimator.from_state(adaptive_state)
         kf._push_state_to_backend()
         return kf
 
