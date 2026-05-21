@@ -1,1 +1,15 @@
+target/
+.venv-*/
+.venv-turbo-ckf/
+.cargo/
+.rustup/
+__pycache__/
+**/__pycache__/
+*.so
+.git/
+.pytest_cache/
+.benchmarks/
+dist/
+build/
+*.egg-info/
 PUBLISHING.md
