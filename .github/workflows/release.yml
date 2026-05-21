@@ -25,8 +25,43 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  version-check:
+    name: Verify version agreement
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Compare Cargo.toml, pyproject.toml, and tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Tag source: workflow_dispatch input, or the pushed ref for release events.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            raw_tag="${{ inputs.tag }}"
+          else
+            raw_tag="${GITHUB_REF##*/}"
+          fi
+          tag_version="${raw_tag#v}"
+
+          cargo_version=$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)
+          pyproject_version=$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' pyproject.toml)
+
+          echo "tag       = $tag_version"
+          echo "Cargo     = $cargo_version"
+          echo "pyproject = $pyproject_version"
+
+          if [ "$tag_version" != "$cargo_version" ] || [ "$tag_version" != "$pyproject_version" ]; then
+            echo "::error::Version mismatch between tag, Cargo.toml, and pyproject.toml"
+            exit 1
+          fi
+
   build-wheels:
     name: Build wheel (${{ matrix.os }})
+    needs: [version-check]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -74,6 +109,7 @@ jobs:
 
   build-sdist:
     name: Build sdist
+    needs: [version-check]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -108,12 +144,16 @@ jobs:
 
   publish-testpypi:
     name: Publish to TestPyPI
-    needs: [build-wheels, build-sdist]
+    # NOTE: ci.yml is a separate workflow (not reusable). It runs on the same
+    # push/PR events but we cannot directly `needs:` it here. Treat a green
+    # CI run on the same SHA as a precondition before manually dispatching.
+    needs: [version-check, build-wheels, build-sdist]
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.repository == 'testpypi' && startsWith(inputs.tag, 'v') }}
     runs-on: ubuntu-latest
     environment: testpypi
     permissions:
       id-token: write
+      attestations: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -128,15 +168,20 @@ jobs:
           repository-url: https://test.pypi.org/legacy/
           packages-dir: dist
           skip-existing: true
+          attestations: true
 
   publish-pypi:
     name: Publish to PyPI
-    needs: [build-wheels, build-sdist]
+    # NOTE: ci.yml is a separate workflow (not reusable). It runs on the same
+    # push/PR events but we cannot directly `needs:` it here. Treat a green
+    # CI run on the same SHA as a precondition before publishing.
+    needs: [version-check, build-wheels, build-sdist]
     if: ${{ (github.event_name == 'release' && github.event.action == 'published') || (github.event_name == 'workflow_dispatch' && inputs.repository == 'pypi' && startsWith(inputs.tag, 'v')) }}
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
+      attestations: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -150,3 +195,4 @@ jobs:
         with:
           packages-dir: dist
           skip-existing: true
+          attestations: true
