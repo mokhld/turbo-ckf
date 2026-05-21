@@ -6,7 +6,9 @@
 #![allow(non_local_definitions)]
 
 use nalgebra::{DMatrix, DVector};
-use numpy::{PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, ToPyArray};
+use numpy::{
+    PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, ToPyArray,
+};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
@@ -792,9 +794,161 @@ fn rts_smooth<'py>(
     Ok((xs_out.to_pyarray(py), ps_out.to_pyarray(py)))
 }
 
+/// Linear Kalman batch filter — single pass over an observation sequence
+/// with all state and matrices held in Rust.
+///
+/// Inputs (all already broadcast to length N by the Python wrapper):
+///   x0: (dim_x,)
+///   p0: (dim_x, dim_x)
+///   zs: (N, dim_z)
+///   fs: (N, dim_x, dim_x) -- F_k for the predict step k-1 -> k
+///   hs: (N, dim_z, dim_x) -- H_k for the linear measurement at step k
+///   qs: (N, dim_x, dim_x)
+///   rs: (N, dim_z, dim_z)
+///
+/// Returns (xs, Ps, log_likelihoods) with shapes (N, dim_x),
+/// (N, dim_x, dim_x), (N,). The output (xs, Ps) is directly consumable by
+/// rts_smooth; no extra reshape needed.
+///
+/// Posterior update uses Joseph form
+/// (P = (I - K H) P (I - K H)^T + K R K^T) to keep P PSD over long runs.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn batch_filter_linear<'py>(
+    py: Python<'py>,
+    x0: PyReadonlyArray1<f64>,
+    p0: PyReadonlyArray2<f64>,
+    zs: PyReadonlyArray2<f64>,
+    fs: PyReadonlyArray3<f64>,
+    hs: PyReadonlyArray3<f64>,
+    qs: PyReadonlyArray3<f64>,
+    rs: PyReadonlyArray3<f64>,
+) -> PyResult<(&'py PyArray2<f64>, &'py PyArray3<f64>, &'py PyArray1<f64>)> {
+    let x0_arr = x0.as_array();
+    let p0_arr = p0.as_array();
+    let zs_arr = zs.as_array();
+    let fs_arr = fs.as_array();
+    let hs_arr = hs.as_array();
+    let qs_arr = qs.as_array();
+    let rs_arr = rs.as_array();
+
+    let dim_x = x0_arr.shape()[0];
+    if dim_x == 0 {
+        return Err(PyValueError::new_err("x0 must have at least one dimension"));
+    }
+    let n = zs_arr.shape()[0];
+    if n == 0 {
+        return Err(PyValueError::new_err(
+            "zs must contain at least one observation",
+        ));
+    }
+    let dim_z = zs_arr.shape()[1];
+
+    let p0_shape = p0_arr.shape();
+    if p0_shape[0] != dim_x || p0_shape[1] != dim_x {
+        return Err(PyValueError::new_err(format!(
+            "P0 must have shape ({dim_x}, {dim_x}); got ({}, {})",
+            p0_shape[0], p0_shape[1]
+        )));
+    }
+    let check_3d = |name: &str, arr: &[usize], a: usize, b: usize, c: usize| -> PyResult<()> {
+        if arr[0] != a || arr[1] != b || arr[2] != c {
+            return Err(PyValueError::new_err(format!(
+                "{name} must have shape ({a}, {b}, {c}); got ({}, {}, {})",
+                arr[0], arr[1], arr[2]
+            )));
+        }
+        Ok(())
+    };
+    check_3d("Fs", fs_arr.shape(), n, dim_x, dim_x)?;
+    check_3d("Hs", hs_arr.shape(), n, dim_z, dim_x)?;
+    check_3d("Qs", qs_arr.shape(), n, dim_x, dim_x)?;
+    check_3d("Rs", rs_arr.shape(), n, dim_z, dim_z)?;
+
+    let mut x = DVector::from_iterator(dim_x, (0..dim_x).map(|j| x0_arr[j]));
+    let mut p = DMatrix::from_fn(dim_x, dim_x, |r, c| p0_arr[[r, c]]);
+
+    let mut xs_out = numpy::ndarray::Array2::<f64>::zeros((n, dim_x));
+    let mut ps_out = numpy::ndarray::Array3::<f64>::zeros((n, dim_x, dim_x));
+    let mut ll_out = numpy::ndarray::Array1::<f64>::zeros(n);
+
+    let eye_x = DMatrix::<f64>::identity(dim_x, dim_x);
+    let log_two_pi = (2.0 * PI).ln();
+
+    for k in 0..n {
+        let f_k = DMatrix::from_fn(dim_x, dim_x, |r, c| fs_arr[[k, r, c]]);
+        let h_k = DMatrix::from_fn(dim_z, dim_x, |r, c| hs_arr[[k, r, c]]);
+        let q_k = DMatrix::from_fn(dim_x, dim_x, |r, c| qs_arr[[k, r, c]]);
+        let r_k = DMatrix::from_fn(dim_z, dim_z, |r, c| rs_arr[[k, r, c]]);
+        let z_k = DVector::from_iterator(dim_z, (0..dim_z).map(|j| zs_arr[[k, j]]));
+
+        // Predict
+        x = &f_k * &x;
+        let mut p_pred = &f_k * &p * f_k.transpose() + &q_k;
+        symmetrize_in_place(&mut p_pred);
+        p = p_pred;
+
+        // Linear update
+        let h_t = h_k.transpose();
+        let z_pred = &h_k * &x;
+        let y = &z_k - &z_pred;
+        let mut s = &h_k * &p * &h_t + &r_k;
+        symmetrize_in_place(&mut s);
+        let (si, _was_singular) = invert_innovation(&s)?;
+        let k_gain = &p * &h_t * &si;
+
+        x = &x + &k_gain * &y;
+        let i_kh = &eye_x - &k_gain * &h_k;
+        let mut p_new = &i_kh * &p * i_kh.transpose() + &k_gain * &r_k * k_gain.transpose();
+        symmetrize_in_place(&mut p_new);
+        p = p_new;
+
+        // Log-likelihood via Cholesky log-det (same path as the per-step filter).
+        let mahal2 = (y.transpose() * &si * &y)[(0, 0)].max(0.0);
+        let ll = if let Some(chol) = s.clone().cholesky() {
+            let l = chol.l();
+            let mut log_det = 0.0;
+            let mut ok = true;
+            for i in 0..l.nrows() {
+                let d = l[(i, i)];
+                if d <= 0.0 || !d.is_finite() {
+                    ok = false;
+                    break;
+                }
+                log_det += d.ln();
+            }
+            log_det *= 2.0;
+            if ok {
+                -0.5 * ((dim_z as f64) * log_two_pi + log_det + mahal2)
+            } else {
+                f64::NEG_INFINITY
+            }
+        } else {
+            f64::NEG_INFINITY
+        };
+        ll_out[k] = ll;
+
+        for j in 0..dim_x {
+            xs_out[[k, j]] = x[j];
+        }
+        for r in 0..dim_x {
+            for c in 0..dim_x {
+                ps_out[[k, r, c]] = p[(r, c)];
+            }
+        }
+    }
+
+    Ok((
+        xs_out.to_pyarray(py),
+        ps_out.to_pyarray(py),
+        ll_out.to_pyarray(py),
+    ))
+}
+
 #[pymodule]
 fn _rust(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<CubatureKalmanFilter>()?;
     m.add_function(wrap_pyfunction!(rts_smooth, m)?)?;
+    m.add_function(wrap_pyfunction!(batch_filter_linear, m)?)?;
     Ok(())
 }
