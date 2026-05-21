@@ -90,6 +90,16 @@ has shifted. Search the new code with the diagnostic name if you want to verify.
   suppressed crate-wide with a documented `#![allow(...)]` (the upstream
   fix requires bumping to a newer PyO3, which is out of scope).
 
+**Session 3 (2026-05-21, shipped as v0.4.0):**
+- `batch_filter` linear Kalman batch routine
+  (`turbo_ckf.batch_filter` / `TurboCKF.batch_filter`) landed as a pure
+  Rust-side loop with Joseph-form posterior. Returns
+  `(xs, Ps, log_likelihoods)` directly consumable by `rts_smooth`. On a
+  10k-step linear CV filter this is ~22x faster than the per-step
+  Python ↔ Rust API (~118 ms → ~5 ms locally), validating audit item
+  9's "order of magnitude" target. Verified by tight numerical parity
+  (~1e-9) against a sequential `predict_linear_model` + `update` loop.
+
 **Session 2 (2026-05-21, shipped as v0.3.0):**
 - RTS smoother (`turbo_ckf.rts_smooth` / `TurboCKF.rts_smooth`) landed as a
   Rust-backed batch routine that accepts `(xs, Ps, Fs, Qs)`. Per-step
@@ -100,7 +110,9 @@ has shifted. Search the new code with the diagnostic name if you want to verify.
   RMSE by well over 30% vs the forward filter.
 
 **Deferred (still open from the audit):**
-- Square-root CKF, batched filtering with rayon, adaptive
+- Square-root CKF, parallel batch filtering over independent state
+  vectors (the rayon use case from feature #3 — distinct from the
+  sequential `batch_filter` that shipped in Session 3), adaptive
   Q/R, multi-rate updates, additional standard models (CTRV/CTRA/Singer).
 - `quaternion omega_cross` sign convention vs paper Eq. (3) — needs an
   actual hardware-trajectory cross-check, not just code review.
