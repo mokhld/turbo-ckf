@@ -362,6 +362,59 @@ class TurboCKF:
         kf._push_state_to_backend()
         return kf
 
+    @staticmethod
+    def rts_smooth(
+        xs: npt.ArrayLike,
+        Ps: npt.ArrayLike,
+        Fs: npt.ArrayLike,
+        Qs: npt.ArrayLike,
+    ) -> tuple[Matrix, np.ndarray]:
+        """Rauch-Tung-Striebel fixed-interval smoother.
+
+        Backward pass over a forward-filtered trace. Per-step ``Fs``/``Qs``
+        let the smoother handle non-constant transitions (use ``np.tile`` if
+        F and Q are actually constant).
+
+        Args:
+            xs: filtered state means, shape ``(N, dim_x)``.
+            Ps: filtered covariances, shape ``(N, dim_x, dim_x)``.
+            Fs: per-step transition matrices ``F_k`` that map step ``k`` to
+                ``k+1``. Shape ``(N, dim_x, dim_x)`` (FilterPy-compatible —
+                last entry unused) or ``(N-1, dim_x, dim_x)``.
+            Qs: per-step process-noise covariances ``Q_k``. Same shape rules
+                as ``Fs``.
+
+        Returns:
+            ``(xs_smooth, Ps_smooth)`` with the same shapes as ``(xs, Ps)``.
+        """
+
+        xs_arr = np.ascontiguousarray(np.asarray(xs, dtype=float))
+        ps_arr = np.ascontiguousarray(np.asarray(Ps, dtype=float))
+        fs_arr = np.ascontiguousarray(np.asarray(Fs, dtype=float))
+        qs_arr = np.ascontiguousarray(np.asarray(Qs, dtype=float))
+
+        if xs_arr.ndim != 2:
+            raise ValueError(
+                f"xs must be 2D with shape (N, dim_x); got ndim={xs_arr.ndim}"
+            )
+        n, dim_x = xs_arr.shape
+        if n == 0:
+            raise ValueError("xs must contain at least one filtered state")
+
+        if ps_arr.shape != (n, dim_x, dim_x):
+            raise ValueError(
+                f"Ps must have shape ({n}, {dim_x}, {dim_x}); got {ps_arr.shape}"
+            )
+        for name, arr in (("Fs", fs_arr), ("Qs", qs_arr)):
+            if arr.ndim != 3 or arr.shape[1:] != (dim_x, dim_x) or arr.shape[0] not in (n, max(n - 1, 0)):
+                raise ValueError(
+                    f"{name} must have shape (N, {dim_x}, {dim_x}) or "
+                    f"(N-1, {dim_x}, {dim_x}); got {arr.shape}"
+                )
+
+        xs_smooth, ps_smooth = _rust.rts_smooth(xs_arr, ps_arr, fs_arr, qs_arr)
+        return np.asarray(xs_smooth, dtype=float), np.asarray(ps_smooth, dtype=float)
+
     def normalize_state_quaternion(self) -> Vector:
         """Normalize the state when it represents a quaternion."""
 
