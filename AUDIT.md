@@ -90,6 +90,24 @@ has shifted. Search the new code with the diagnostic name if you want to verify.
   suppressed crate-wide with a documented `#![allow(...)]` (the upstream
   fix requires bumping to a newer PyO3, which is out of scope).
 
+**Session 4 (2026-05-21, shipped as v0.5.0):**
+- Square-root CKF landed as a new `TurboSRCKF` class (Rust backend
+  `SquareRootCubatureKalmanFilter`). Propagates the lower-triangular
+  Cholesky factor of P directly: predict via a single QR of stacked
+  centered sigma deltas + `chol(Q)`; update via one QR for the innovation
+  factor + per-dim_z rank-1 Cholesky downdates of the state factor.
+  No `stable_cholesky` calls on P inside the filter loop. New
+  `downdate_fallback_count` diagnostic surfaces the rare extreme-
+  conditioning case where the rank-1 downdate would break PD and we
+  rebuild P_post. Mirrors `predict_custom` + `update` only; standard-
+  model paths and AHRS stay on `TurboCKF`. Verified by (1) ~1e-14 state
+  + covariance parity vs `TurboCKF` on a 60-step linear-Gaussian CV
+  trajectory plus a 200-step pure-predict chain (well within the 1e-8
+  acceptance bar); (2) ill-conditioned trajectory (rank-deficient P
+  with eigenvalue ratio 1e18 + tiny R) where `TurboCKF.jitter_count > 0`
+  while `TurboSRCKF.jitter_count == 0`. All 62 prior tests stay green;
+  8 new SR-CKF tests added (74 total).
+
 **Session 3 (2026-05-21, shipped as v0.4.0):**
 - `batch_filter` linear Kalman batch routine
   (`turbo_ckf.batch_filter` / `TurboCKF.batch_filter`) landed as a pure
@@ -110,10 +128,12 @@ has shifted. Search the new code with the diagnostic name if you want to verify.
   RMSE by well over 30% vs the forward filter.
 
 **Deferred (still open from the audit):**
-- Square-root CKF, parallel batch filtering over independent state
-  vectors (the rayon use case from feature #3 — distinct from the
-  sequential `batch_filter` that shipped in Session 3), adaptive
-  Q/R, multi-rate updates, additional standard models (CTRV/CTRA/Singer).
+- Parallel batch filtering over independent state vectors (the rayon
+  use case from feature #3 — distinct from the sequential
+  `batch_filter` that shipped in Session 3), adaptive Q/R, multi-rate
+  updates, additional standard models (CTRV/CTRA/Singer). Square-root
+  CKF for the standard-model and AHRS paths (Session 4 covered
+  `predict_custom` + `update` only).
 - `quaternion omega_cross` sign convention vs paper Eq. (3) — needs an
   actual hardware-trajectory cross-check, not just code review.
 - Cross-backend benchmark vs Numba/JAX.

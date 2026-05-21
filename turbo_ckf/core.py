@@ -730,3 +730,292 @@ class TurboCKF:
         if isinstance(args, list):
             return tuple(args)
         return (args,)
+
+
+class TurboSRCKF:
+    """Square-root Cubature Kalman Filter (SR-CKF).
+
+    Propagates the lower-triangular Cholesky factor of P directly instead of
+    P itself. Predict step uses a single QR of stacked weighted sigma-point
+    deltas + ``chol(Q)``; update uses one QR for the innovation factor plus
+    ``dim_z`` rank-1 Cholesky downdates for the posterior factor. The full
+    filter loop never calls ``stable_cholesky`` on P — so the silent
+    jitter-on-the-diagonal hazard that the standard :class:`TurboCKF`
+    accumulates at every predict simply doesn't exist here.
+
+    Same vectorised callback contract as :class:`TurboCKF`: ``fx`` and ``hx``
+    take ``(2 * dim_x, dim_x)`` batches of sigma points and return
+    ``(2 * dim_x, dim_x)`` and ``(2 * dim_x, dim_z)`` respectively.
+
+    Only the ``predict_custom`` + ``update`` API surface from TurboCKF is
+    mirrored here. For linear closed-form predicts or the paper AHRS update
+    use :class:`TurboCKF` (the silent-jitter blast radius on those paths is
+    bounded by per-step measurements anyway, so the SR variant is lower
+    leverage).
+    """
+
+    def __init__(
+        self,
+        dim_x: int,
+        dim_z: int,
+        dt: float,
+        hx: Callable[..., npt.ArrayLike],
+        fx: Callable[..., npt.ArrayLike],
+    ) -> None:
+        if dim_x <= 0 or dim_z <= 0:
+            raise ValueError("dim_x and dim_z must be positive")
+        if not np.isfinite(dt):
+            raise ValueError("dt must be finite")
+
+        self.dim_x = int(dim_x)
+        self.dim_z = int(dim_z)
+        self.dt = float(dt)
+        self.hx = hx
+        self.fx = fx
+
+        # State + factor view.
+        self.x: Vector = np.zeros(self.dim_x, dtype=float)
+        self.P: Matrix = np.eye(self.dim_x, dtype=float)
+        self.chol_P: Matrix = np.eye(self.dim_x, dtype=float)
+        self.Q: Matrix = np.eye(self.dim_x, dtype=float)
+        self.chol_Q: Matrix = np.eye(self.dim_x, dtype=float)
+        self.R: Matrix = np.eye(self.dim_z, dtype=float)
+        self.chol_R: Matrix = np.eye(self.dim_z, dtype=float)
+
+        self.K: Matrix = np.zeros((self.dim_x, self.dim_z), dtype=float)
+        self.y: Vector = np.zeros(self.dim_z, dtype=float)
+        self.z: Vector = np.zeros(self.dim_z, dtype=float)
+        self.S: Matrix = np.eye(self.dim_z, dtype=float)
+        self.S_innov: Matrix = np.eye(self.dim_z, dtype=float)
+
+        self.x_prior: Vector = self.x.copy()
+        self.P_prior: Matrix = self.P.copy()
+        self.x_post: Vector = self.x.copy()
+        self.P_post: Matrix = self.P.copy()
+
+        self.z_pred: Vector = np.zeros(self.dim_z, dtype=float)
+        self.log_likelihood: float = float("nan")
+        self.likelihood: float = float("nan")
+        self.mahalanobis: float = float("nan")
+        self.nis: float = float("nan")
+
+        # Diagnostics mirror TurboCKF's surface; downdate_fallback_count is
+        # specific to the square-root posterior path.
+        self.last_jitter: float = 0.0
+        self.max_jitter: float = 0.0
+        self.jitter_count: int = 0
+        self.singular_innovation_count: int = 0
+        self.downdate_fallback_count: int = 0
+
+        self._rust_backend = _rust.SquareRootCubatureKalmanFilter(
+            self.dim_x, self.dim_z, self.dt
+        )
+        self._backend_name = "rust-sr"
+
+    def __repr__(self) -> str:
+        return (
+            f"TurboSRCKF(dim_x={self.dim_x}, dim_z={self.dim_z}, dt={self.dt}, "
+            f"backend={self._backend_name!r}, "
+            f"log_likelihood={self.log_likelihood:.4g}, "
+            f"jitter_count={self.jitter_count}, "
+            f"downdate_fallback_count={self.downdate_fallback_count})"
+        )
+
+    # ----- prediction ------------------------------------------------------
+
+    def predict(
+        self,
+        dt: float | None = None,
+        fx: Callable[..., npt.ArrayLike] | None = None,
+        fx_args: Sequence[object] | object = (),
+    ) -> Vector:
+        """Time-update step (mirrors ``TurboCKF.predict``)."""
+
+        local_dt = self.dt if dt is None else float(dt)
+        if not np.isfinite(local_dt):
+            raise ValueError("dt must be finite")
+        transition = self.fx if fx is None else fx
+        args = TurboCKF._coerce_args(fx_args)
+
+        self._push_state_to_backend()
+        self._rust_backend.predict_custom(
+            self._make_backend_model(transition, expected_dim=self.dim_x, include_dt=True),
+            local_dt,
+            args,
+        )
+        self._pull_state_from_backend()
+        return self.x
+
+    # ----- update ----------------------------------------------------------
+
+    def update(
+        self,
+        z: npt.ArrayLike | None,
+        R: npt.ArrayLike | None = None,
+        hx: Callable[..., npt.ArrayLike] | None = None,
+        hx_args: Sequence[object] | object = (),
+    ) -> Vector:
+        """Measurement-update step.
+
+        ``z=None`` skips the update and clears innovation diagnostics so the
+        next NIS gate can't read a stale value (same contract as
+        :meth:`TurboCKF.update`).
+        """
+
+        if z is None:
+            self._push_state_to_backend()
+            self._rust_backend.clear_update_diagnostics()
+            self._pull_state_from_backend()
+            self.x_post = self.x.copy()
+            self.P_post = self.P.copy()
+            self.z = np.full(self.dim_z, np.nan, dtype=float)
+            return self.x
+
+        measurement_fn = self.hx if hx is None else hx
+        args = TurboCKF._coerce_args(hx_args)
+        z_vec = TurboCKF._as_vector(z, self.dim_z, "z")
+        r_mat = TurboCKF._coerce_covariance(self.R if R is None else R, self.dim_z, "R")
+
+        self._push_state_to_backend()
+        self._rust_backend.update(
+            z_vec,
+            self._make_backend_model(measurement_fn, expected_dim=self.dim_z, include_dt=False),
+            r_mat,
+            args,
+        )
+        self._pull_state_from_backend()
+        return self.x
+
+    # ----- diagnostics / utility ------------------------------------------
+
+    def gate(self, threshold: float) -> bool:
+        """Chi-square gating on the most recent NIS (same contract as TurboCKF.gate)."""
+
+        if not np.isfinite(self.nis):
+            return False
+        return float(self.nis) <= float(threshold)
+
+    def reset(self, x: npt.ArrayLike | None = None, P: npt.ArrayLike | None = None) -> None:
+        """Reset state + diagnostics. ``Q``, ``R``, ``dt``, ``fx``, ``hx`` are preserved."""
+
+        self.x = (
+            np.zeros(self.dim_x, dtype=float)
+            if x is None
+            else TurboCKF._as_vector(x, self.dim_x, "x")
+        )
+        self.P = (
+            np.eye(self.dim_x, dtype=float)
+            if P is None
+            else TurboCKF._coerce_covariance(P, self.dim_x, "P")
+        )
+        self.K = np.zeros((self.dim_x, self.dim_z), dtype=float)
+        self.y = np.zeros(self.dim_z, dtype=float)
+        self.z = np.zeros(self.dim_z, dtype=float)
+        self.S = np.eye(self.dim_z, dtype=float)
+        self.S_innov = np.eye(self.dim_z, dtype=float)
+        self.x_prior = self.x.copy()
+        self.P_prior = self.P.copy()
+        self.x_post = self.x.copy()
+        self.P_post = self.P.copy()
+        self.z_pred = np.zeros(self.dim_z, dtype=float)
+        self.log_likelihood = float("nan")
+        self.likelihood = float("nan")
+        self.mahalanobis = float("nan")
+        self.nis = float("nan")
+        self.last_jitter = 0.0
+        self.max_jitter = 0.0
+        self.jitter_count = 0
+        self.singular_innovation_count = 0
+        self.downdate_fallback_count = 0
+        self._rust_backend = _rust.SquareRootCubatureKalmanFilter(
+            self.dim_x, self.dim_z, self.dt
+        )
+        self._push_state_to_backend()
+
+    def reset_jitter_counters(self) -> None:
+        """Zero all jitter / downdate diagnostics after seeding state.
+
+        Useful for tests that want to measure per-step jitter without the
+        one-shot init-time Cholesky cost showing up in the counters.
+        """
+
+        self._rust_backend.reset_jitter_counters()
+        self.last_jitter = 0.0
+        self.max_jitter = 0.0
+        self.jitter_count = 0
+        self.singular_innovation_count = 0
+        self.downdate_fallback_count = 0
+
+    # ----- internals -------------------------------------------------------
+
+    def _push_state_to_backend(self) -> None:
+        self._rust_backend.set_state(self.x, self.P, self.Q, self.R)
+
+    def _pull_state_from_backend(self) -> None:
+        snap = self._rust_backend.snapshot()
+        self.x = np.asarray(snap["x"], dtype=float).reshape(-1)
+        self.chol_P = np.asarray(snap["chol_P"], dtype=float)
+        self.P = np.asarray(snap["P"], dtype=float)
+        self.chol_Q = np.asarray(snap["chol_Q"], dtype=float)
+        self.Q = np.asarray(snap["Q"], dtype=float)
+        self.chol_R = np.asarray(snap["chol_R"], dtype=float)
+        self.R = np.asarray(snap["R"], dtype=float)
+        self.K = np.asarray(snap["K"], dtype=float)
+        self.y = np.asarray(snap["y"], dtype=float).reshape(-1)
+        self.z = np.asarray(snap["z"], dtype=float).reshape(-1)
+        self.S = np.asarray(snap["S"], dtype=float)
+        self.S_innov = np.asarray(snap["S_innov"], dtype=float)
+        self.x_prior = np.asarray(snap["x_prior"], dtype=float).reshape(-1)
+        self.P_prior = np.asarray(snap["P_prior"], dtype=float)
+        self.x_post = np.asarray(snap["x_post"], dtype=float).reshape(-1)
+        self.P_post = np.asarray(snap["P_post"], dtype=float)
+        self.z_pred = np.asarray(snap["z_pred"], dtype=float).reshape(-1)
+        self.log_likelihood = float(snap["log_likelihood"])
+        self.likelihood = float(snap["likelihood"])
+        self.mahalanobis = float(snap["mahalanobis"])
+        self.nis = float(snap["nis"])
+        self.last_jitter = float(snap["last_jitter"])
+        self.max_jitter = float(snap["max_jitter"])
+        self.jitter_count = int(snap["jitter_count"])
+        self.singular_innovation_count = int(snap["singular_innovation_count"])
+        self.downdate_fallback_count = int(snap["downdate_fallback_count"])
+
+    def _make_backend_model(
+        self,
+        model: Callable[..., npt.ArrayLike],
+        expected_dim: int,
+        include_dt: bool,
+    ) -> Callable[..., Matrix]:
+        def _wrapped(sigma_points, *call_args):
+            sigma = np.asarray(sigma_points, dtype=float)
+            if sigma.ndim != 2:
+                raise ValueError(
+                    "fx/hx must accept a 2D batch of sigma points with shape "
+                    f"(2 * dim_x, dim_x); got ndim={sigma.ndim}. See README "
+                    "for the vectorized-callback contract."
+                )
+            if include_dt:
+                if len(call_args) == 0:
+                    raise ValueError("missing dt argument for transition callback")
+                local_dt = float(call_args[0])
+                extra_args = call_args[1:]
+            else:
+                local_dt = 0.0
+                extra_args = call_args
+            args = tuple(extra_args or ())
+            expected_shape = (sigma.shape[0], expected_dim)
+            if include_dt:
+                raw = model(sigma, local_dt, *args)
+            else:
+                raw = model(sigma, *args)
+            arr = np.asarray(raw, dtype=float)
+            if arr.shape != expected_shape:
+                raise ValueError(
+                    f"fx/hx must return shape {expected_shape}, got {arr.shape}. "
+                    "TurboSRCKF requires vectorized callbacks — write fx/hx so "
+                    "that they map a batch of sigma points (rows) to a batch "
+                    "of outputs (rows). Pointwise callbacks are not supported."
+                )
+            return arr
+
+        return _wrapped
