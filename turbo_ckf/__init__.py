@@ -10,8 +10,11 @@ from .paper_ahrs import (
     transition_matrix_from_gyro,
 )
 
+rts_smooth = TurboCKF.rts_smooth
+
 __all__ = [
     "TurboCKF",
+    "rts_smooth",
     "magnetic_reference_terms",
     "measurement_noise",
     "normalize_quaternion",
