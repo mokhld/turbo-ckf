@@ -90,6 +90,28 @@ has shifted. Search the new code with the diagnostic name if you want to verify.
   suppressed crate-wide with a documented `#![allow(...)]` (the upstream
   fix requires bumping to a newer PyO3, which is out of scope).
 
+**Session 5 (2026-05-21, shipped as v0.6.0):**
+- Parallel batch predict+update path
+  (`turbo_ckf.batch_parallel_step` / `TurboCKF.batch_parallel_step`)
+  landed. Takes a bank of `M` independent linear KFs sharing `(F, H, Q, R)`,
+  each with its own `(x_i, P_i, z_i)`, and runs the `M` predict+update
+  steps in parallel via `rayon` with the GIL released. Activates the
+  previously-listed-but-unused `rayon` dependency (audit improvement
+  item). Distinct from v0.4.0's `batch_filter` ("one filter, many
+  observations") — this is "many filters, one observation each", the
+  Monte-Carlo / particle-bank / multi-target-tracking pattern called
+  out in the audit's deferred items.
+  Per-filter failure (singular `S`) reports through a new `(M,)` status
+  array (`0` ok, `1` pseudo-inverse fallback, `2` no inverse — predict-
+  only output) instead of aborting the bank. Verified by (1) ~1e-10 state
+  + covariance + log-likelihood parity vs a sequential `TurboCKF`
+  per-step reference loop on `M=100`; (2) perf gate at `M=10,000`
+  enforcing ≥ 4x speedup over the sequential Rust per-step path —
+  locally measured at ~70x (125 ms → 1.8 ms) on M-class Apple silicon.
+  All 74 prior tests stay green; 6 new tests added (80 total).
+  Scope kept to the linear path; nonlinear via Python `fx`/`hx`
+  callbacks would serialize on the GIL — deferred.
+
 **Session 4 (2026-05-21, shipped as v0.5.0):**
 - Square-root CKF landed as a new `TurboSRCKF` class (Rust backend
   `SquareRootCubatureKalmanFilter`). Propagates the lower-triangular
@@ -128,9 +150,9 @@ has shifted. Search the new code with the diagnostic name if you want to verify.
   RMSE by well over 30% vs the forward filter.
 
 **Deferred (still open from the audit):**
-- Parallel batch filtering over independent state vectors (the rayon
-  use case from feature #3 — distinct from the sequential
-  `batch_filter` that shipped in Session 3), adaptive Q/R, multi-rate
+- Nonlinear parallel batch step via Python `fx`/`hx` callbacks (Session 5
+  covered the linear path only — callbacks would serialize on the GIL;
+  needs a pure-Rust callback contract). Adaptive Q/R, multi-rate
   updates, additional standard models (CTRV/CTRA/Singer). Square-root
   CKF for the standard-model and AHRS paths (Session 4 covered
   `predict_custom` + `update` only).
