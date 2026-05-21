@@ -457,6 +457,115 @@ class TurboCKF:
         )
 
     @staticmethod
+    def batch_parallel_step(
+        xs: npt.ArrayLike,
+        Ps: npt.ArrayLike,
+        zs: npt.ArrayLike,
+        F: npt.ArrayLike,
+        H: npt.ArrayLike,
+        Q: npt.ArrayLike | None = None,
+        R: npt.ArrayLike | None = None,
+    ) -> tuple[Matrix, np.ndarray, Vector, np.ndarray]:
+        """Parallel linear predict+update across a bank of M independent KFs.
+
+        The "many filters, one observation each" pattern (Monte-Carlo banks,
+        particle filters, multi-target tracking). Distinct from
+        :meth:`batch_filter` ("one filter, many observations") — here every
+        filter advances by exactly one predict + linear update against its
+        own ``z_i``, and the bank shares a single ``(F, H, Q, R)``.
+        The M steps run in parallel via rayon with the GIL released.
+
+        Args:
+            xs: prior states, shape ``(M, dim_x)``.
+            Ps: prior covariances, shape ``(M, dim_x, dim_x)``.
+            zs: per-filter observations, shape ``(M, dim_z)``.
+            F: shared transition, shape ``(dim_x, dim_x)``.
+            H: shared measurement, shape ``(dim_z, dim_x)``.
+            Q: shared process noise, shape ``(dim_x, dim_x)``. Defaults to
+                zeros.
+            R: shared measurement noise, shape ``(dim_z, dim_z)``. Defaults
+                to identity.
+
+        Returns:
+            ``(xs_new, Ps_new, log_likelihoods, status)`` with shapes
+            ``(M, dim_x)``, ``(M, dim_x, dim_x)``, ``(M,)``, ``(M,)``.
+
+            ``status[i]`` reports per-filter health:
+
+            * ``0`` — innovation covariance was PD (Cholesky succeeded).
+            * ``1`` — innovation covariance was singular; used the
+              pseudo-inverse fallback for ``K``. Treat as a soft warning.
+            * ``2`` — no inverse at all; the measurement update was
+              **skipped** and ``log_likelihoods[i] = -inf``. The returned
+              ``(xs_new[i], Ps_new[i])`` is the predict-step output only.
+
+            One bad filter does not abort the bank — Monte-Carlo callers
+            can mask on ``status != 2`` and keep going.
+        """
+
+        xs_arr = np.ascontiguousarray(np.asarray(xs, dtype=float))
+        ps_arr = np.ascontiguousarray(np.asarray(Ps, dtype=float))
+        zs_arr = np.ascontiguousarray(np.asarray(zs, dtype=float))
+        f_arr = np.ascontiguousarray(np.asarray(F, dtype=float))
+        h_arr = np.ascontiguousarray(np.asarray(H, dtype=float))
+
+        if xs_arr.ndim != 2:
+            raise ValueError(
+                f"xs must be 2D with shape (M, dim_x); got ndim={xs_arr.ndim}"
+            )
+        m, dim_x = xs_arr.shape
+        if m == 0:
+            raise ValueError("xs must contain at least one filter")
+        if dim_x == 0:
+            raise ValueError("dim_x must be positive")
+
+        if zs_arr.ndim != 2 or zs_arr.shape[0] != m:
+            raise ValueError(
+                f"zs must have shape ({m}, dim_z); got {zs_arr.shape}"
+            )
+        dim_z = zs_arr.shape[1]
+        if dim_z == 0:
+            raise ValueError("dim_z must be positive")
+
+        if ps_arr.shape != (m, dim_x, dim_x):
+            raise ValueError(
+                f"Ps must have shape ({m}, {dim_x}, {dim_x}); got {ps_arr.shape}"
+            )
+        if f_arr.shape != (dim_x, dim_x):
+            raise ValueError(
+                f"F must have shape ({dim_x}, {dim_x}); got {f_arr.shape}"
+            )
+        if h_arr.shape != (dim_z, dim_x):
+            raise ValueError(
+                f"H must have shape ({dim_z}, {dim_x}); got {h_arr.shape}"
+            )
+
+        q_arr = np.ascontiguousarray(
+            np.asarray(Q if Q is not None else np.zeros((dim_x, dim_x)), dtype=float)
+        )
+        r_arr = np.ascontiguousarray(
+            np.asarray(R if R is not None else np.eye(dim_z), dtype=float)
+        )
+        if q_arr.shape != (dim_x, dim_x):
+            raise ValueError(
+                f"Q must have shape ({dim_x}, {dim_x}); got {q_arr.shape}"
+            )
+        if r_arr.shape != (dim_z, dim_z):
+            raise ValueError(
+                f"R must have shape ({dim_z}, {dim_z}); got {r_arr.shape}"
+            )
+
+        xs_new, ps_new, lls, status = _rust.batch_parallel_step(
+            xs_arr, ps_arr, zs_arr, f_arr, h_arr, q_arr, r_arr
+        )
+        return (
+            np.asarray(xs_new, dtype=float),
+            np.asarray(ps_new, dtype=float),
+            np.asarray(lls, dtype=float),
+            np.asarray(status, dtype=np.int64),
+        )
+
+    @staticmethod
     def rts_smooth(
         xs: npt.ArrayLike,
         Ps: npt.ArrayLike,
