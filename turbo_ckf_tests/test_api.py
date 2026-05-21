@@ -34,8 +34,20 @@ class APITests(unittest.TestCase):
         self.assertEqual(ckf.R.shape, (1, 1))
 
     def test_predict_update_signatures(self):
-        self.assertEqual(str(inspect.signature(TurboCKF.predict)), "(self, dt=None, fx=None, fx_args=())")
-        self.assertEqual(str(inspect.signature(TurboCKF.update)), "(self, z, R=None, hx=None, hx_args=())")
+        # Assert parameter names + defaults rather than the full str() of the
+        # signature, so adding type hints doesn't break the test.
+        predict_params = inspect.signature(TurboCKF.predict).parameters
+        self.assertEqual(list(predict_params.keys()), ["self", "dt", "fx", "fx_args"])
+        self.assertIsNone(predict_params["dt"].default)
+        self.assertIsNone(predict_params["fx"].default)
+        self.assertEqual(predict_params["fx_args"].default, ())
+
+        update_params = inspect.signature(TurboCKF.update).parameters
+        self.assertEqual(list(update_params.keys()), ["self", "z", "R", "hx", "hx_args"])
+        self.assertIs(update_params["z"].default, inspect.Parameter.empty)
+        self.assertIsNone(update_params["R"].default)
+        self.assertIsNone(update_params["hx"].default)
+        self.assertEqual(update_params["hx_args"].default, ())
 
     def test_core_state_attributes_exist(self):
         ckf = TurboCKF(dim_x=2, dim_z=1, dt=0.1, hx=hx, fx=fx)

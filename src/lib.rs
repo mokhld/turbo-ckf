@@ -1,3 +1,10 @@
+//! Turbo CKF Rust backend.
+//!
+//! PyO3 0.20's `#[pymethods]` macro emits non-local `impl` blocks. That is
+//! a lint introduced in newer rustc versions; bumping PyO3 fixes it but is
+//! out of scope for this change.
+#![allow(non_local_definitions)]
+
 use nalgebra::{DMatrix, DVector};
 use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -27,6 +34,14 @@ pub struct CubatureKalmanFilter {
     log_likelihood: f64,
     likelihood: f64,
     mahalanobis: f64,
+    nis: f64,
+    // Diagnostics for stable_cholesky: jitter added to the diagonal because
+    // P drifted toward non-positive-definite. Surfaced via snapshot() so users
+    // can detect silent numerical conditioning issues.
+    last_jitter: f64,
+    max_jitter: f64,
+    jitter_count: u64,
+    singular_innovation_count: u64,
 }
 
 #[pymethods]
@@ -35,6 +50,9 @@ impl CubatureKalmanFilter {
     fn new(dim_x: usize, dim_z: usize, dt: f64) -> PyResult<Self> {
         if dim_x == 0 || dim_z == 0 {
             return Err(PyValueError::new_err("dim_x and dim_z must be positive"));
+        }
+        if !dt.is_finite() {
+            return Err(PyValueError::new_err("dt must be finite"));
         }
         Ok(Self {
             dim_x,
@@ -57,6 +75,11 @@ impl CubatureKalmanFilter {
             log_likelihood: f64::NAN,
             likelihood: f64::NAN,
             mahalanobis: f64::NAN,
+            nis: f64::NAN,
+            last_jitter: 0.0,
+            max_jitter: 0.0,
+            jitter_count: 0,
+            singular_innovation_count: 0,
         })
     }
 
@@ -84,16 +107,21 @@ impl CubatureKalmanFilter {
         fx_args: Option<&PyTuple>,
     ) -> PyResult<()> {
         let local_dt = dt.unwrap_or(self.dt);
-        let sigma = cubature_points(&self.x, &self.p)?;
+        if !local_dt.is_finite() {
+            return Err(PyValueError::new_err("dt must be finite"));
+        }
+        let (sigma, jitter) = cubature_points(&self.x, &self.p)?;
+        self.record_jitter(jitter);
         let args = fx_args.unwrap_or_else(|| PyTuple::empty(py));
         let propagated = call_model_vectorized(py, &fx, &sigma, Some(local_dt), args, self.dim_x)?;
 
-        let m = propagated.nrows();
-        let w = 1.0 / (m as f64);
+        let w = 1.0 / (propagated.nrows() as f64);
 
         let mean = row_mean(&propagated, self.dim_x);
-        let second_moment = propagated.transpose() * &propagated * w;
-        let cov = symmetrize(&(second_moment - (&mean * mean.transpose()) + &self.q));
+        // tr_mul avoids materializing propagated.transpose().
+        let second_moment = propagated.tr_mul(&propagated) * w;
+        let mut cov = second_moment - &mean * mean.transpose() + &self.q;
+        symmetrize_in_place(&mut cov);
 
         self.x = mean;
         self.p = cov;
@@ -107,6 +135,14 @@ impl CubatureKalmanFilter {
         let f = transition_matrix(model_type, self.dim_x, self.dt)?;
         self.predict_kckf_linear(&f);
         Ok(())
+    }
+
+    /// Convenience for callers: list of model strings accepted by
+    /// predict_standard_model[_ckf]. Lets the Python wrapper validate input
+    /// with a friendly error before reaching the backend.
+    #[staticmethod]
+    fn supported_standard_models() -> Vec<&'static str> {
+        vec!["constant_velocity", "constant_acceleration"]
     }
 
     #[pyo3(signature = (model_type))]
@@ -130,6 +166,29 @@ impl CubatureKalmanFilter {
         Ok(())
     }
 
+    /// Clear cached innovation / likelihood diagnostics. Used by the Python
+    /// wrapper when a measurement is skipped (`update(z=None)`), so callers
+    /// don't accidentally re-read stale values.
+    fn clear_update_diagnostics(&mut self) {
+        self.y = DVector::zeros(self.dim_z);
+        self.z = DVector::zeros(self.dim_z);
+        self.z_pred = DVector::zeros(self.dim_z);
+        self.s = DMatrix::identity(self.dim_z, self.dim_z);
+        self.si = DMatrix::identity(self.dim_z, self.dim_z);
+        self.k = DMatrix::zeros(self.dim_x, self.dim_z);
+        self.log_likelihood = f64::NAN;
+        self.likelihood = f64::NAN;
+        self.mahalanobis = f64::NAN;
+        self.nis = f64::NAN;
+    }
+
+    fn reset_jitter_counters(&mut self) {
+        self.last_jitter = 0.0;
+        self.max_jitter = 0.0;
+        self.jitter_count = 0;
+        self.singular_innovation_count = 0;
+    }
+
     #[pyo3(signature = (z, hx, r=None, hx_args=None))]
     fn update(
         &mut self,
@@ -146,31 +205,30 @@ impl CubatureKalmanFilter {
             self.r.clone()
         };
 
-        let sigma = cubature_points(&self.x, &self.p)?;
+        let (sigma, jitter) = cubature_points(&self.x, &self.p)?;
+        self.record_jitter(jitter);
         let args = hx_args.unwrap_or_else(|| PyTuple::empty(py));
         let z_sigma = call_model_vectorized(py, &hx, &sigma, None, args, self.dim_z)?;
 
-        let m = sigma.nrows();
-        let w = 1.0 / (m as f64);
+        let w = 1.0 / (sigma.nrows() as f64);
 
         let z_pred = row_mean(&z_sigma, self.dim_z);
-        let pxz = (sigma.transpose() * &z_sigma) * w - (&self.x * z_pred.transpose());
-        let pzz = symmetrize(&((z_sigma.transpose() * &z_sigma) * w - (&z_pred * z_pred.transpose()) + &r_mat));
+        let pxz = sigma.tr_mul(&z_sigma) * w - (&self.x * z_pred.transpose());
+        let mut pzz = z_sigma.tr_mul(&z_sigma) * w - &z_pred * z_pred.transpose() + &r_mat;
+        symmetrize_in_place(&mut pzz);
 
-        let si = if let Some(inv) = pzz.clone().try_inverse() {
-            inv
-        } else {
-            pzz.clone()
-                .svd(true, true)
-                .pseudo_inverse(1e-12)
-                .map_err(|_| PyRuntimeError::new_err("failed to invert innovation covariance"))?
-        };
+        let (si, was_singular) = invert_innovation(&pzz)?;
+        if was_singular {
+            self.singular_innovation_count = self.singular_innovation_count.saturating_add(1);
+        }
 
         let k = &pxz * &si;
         let y = &z_vec - &z_pred;
 
         self.x = &self.x + &k * &y;
-        self.p = symmetrize(&(&self.p - &k * &pzz * k.transpose()));
+        let mut p_new = &self.p - &k * &pzz * k.transpose();
+        symmetrize_in_place(&mut p_new);
+        self.p = p_new;
 
         self.z = z_vec;
         self.z_pred = z_pred;
@@ -196,10 +254,21 @@ impl CubatureKalmanFilter {
                 "update_paper_ahrs requires dim_x == 4 and dim_z == 6",
             ));
         }
+        if !sigma_acc2.is_finite() || sigma_acc2 <= 0.0 {
+            return Err(PyValueError::new_err(
+                "sigma_acc2 must be finite and positive",
+            ));
+        }
+        if !sigma_mag2.is_finite() || sigma_mag2 <= 0.0 {
+            return Err(PyValueError::new_err(
+                "sigma_mag2 must be finite and positive",
+            ));
+        }
         let z_vec = pyarray1_to_dvector(z, self.dim_z, "z")?;
         let (m_n, m_d) = magnetic_reference_terms(&z_vec)?;
 
-        let sigma = cubature_points(&self.x, &self.p)?;
+        let (sigma, jitter) = cubature_points(&self.x, &self.p)?;
+        self.record_jitter(jitter);
         let z_sigma = paper_observation_model(&sigma, m_n, m_d);
 
         let mut r_mat = DMatrix::<f64>::zeros(6, 6);
@@ -208,27 +277,25 @@ impl CubatureKalmanFilter {
             r_mat[(i + 3, i + 3)] = sigma_mag2;
         }
 
-        let m = sigma.nrows();
-        let w = 1.0 / (m as f64);
+        let w = 1.0 / (sigma.nrows() as f64);
 
         let z_pred = row_mean(&z_sigma, self.dim_z);
-        let pxz = (sigma.transpose() * &z_sigma) * w - (&self.x * z_pred.transpose());
-        let pzz = symmetrize(&((z_sigma.transpose() * &z_sigma) * w - (&z_pred * z_pred.transpose()) + &r_mat));
+        let pxz = sigma.tr_mul(&z_sigma) * w - (&self.x * z_pred.transpose());
+        let mut pzz = z_sigma.tr_mul(&z_sigma) * w - &z_pred * z_pred.transpose() + &r_mat;
+        symmetrize_in_place(&mut pzz);
 
-        let si = if let Some(inv) = pzz.clone().try_inverse() {
-            inv
-        } else {
-            pzz.clone()
-                .svd(true, true)
-                .pseudo_inverse(1e-12)
-                .map_err(|_| PyRuntimeError::new_err("failed to invert innovation covariance"))?
-        };
+        let (si, was_singular) = invert_innovation(&pzz)?;
+        if was_singular {
+            self.singular_innovation_count = self.singular_innovation_count.saturating_add(1);
+        }
 
         let k = &pxz * &si;
         let y = &z_vec - &z_pred;
 
         self.x = &self.x + &k * &y;
-        self.p = symmetrize(&(&self.p - &k * &pzz * k.transpose()));
+        let mut p_new = &self.p - &k * &pzz * k.transpose();
+        symmetrize_in_place(&mut p_new);
+        self.p = p_new;
 
         self.z = z_vec;
         self.z_pred = z_pred;
@@ -251,7 +318,9 @@ impl CubatureKalmanFilter {
         }
         let norm = self.x.norm();
         if !norm.is_finite() || norm <= 0.0 {
-            return Err(PyValueError::new_err("quaternion norm must be finite and positive"));
+            return Err(PyValueError::new_err(
+                "quaternion norm must be finite and positive",
+            ));
         }
         self.x /= norm;
         self.x_post = self.x.clone();
@@ -277,6 +346,11 @@ impl CubatureKalmanFilter {
         out.set_item("log_likelihood", self.log_likelihood)?;
         out.set_item("likelihood", self.likelihood)?;
         out.set_item("mahalanobis", self.mahalanobis)?;
+        out.set_item("nis", self.nis)?;
+        out.set_item("last_jitter", self.last_jitter)?;
+        out.set_item("max_jitter", self.max_jitter)?;
+        out.set_item("jitter_count", self.jitter_count)?;
+        out.set_item("singular_innovation_count", self.singular_innovation_count)?;
         Ok(out.to_object(py))
     }
 }
@@ -284,21 +358,24 @@ impl CubatureKalmanFilter {
 impl CubatureKalmanFilter {
     fn predict_kckf_linear(&mut self, f: &DMatrix<f64>) {
         self.x = f * &self.x;
-        self.p = symmetrize(&(f * &self.p * f.transpose() + &self.q));
+        let mut new_p = f * &self.p * f.transpose() + &self.q;
+        symmetrize_in_place(&mut new_p);
+        self.p = new_p;
         self.x_prior = self.x.clone();
         self.p_prior = self.p.clone();
     }
 
     fn predict_ckf_linear(&mut self, f: &DMatrix<f64>) -> PyResult<()> {
-        let sigma = cubature_points(&self.x, &self.p)?;
+        let (sigma, jitter) = cubature_points(&self.x, &self.p)?;
+        self.record_jitter(jitter);
         // Propagate each row-vector cubature point through the linear model.
-        let propagated = sigma * f.transpose();
-        let m = propagated.nrows();
-        let w = 1.0 / (m as f64);
+        let propagated = &sigma * f.transpose();
+        let w = 1.0 / (propagated.nrows() as f64);
 
         let mean = row_mean(&propagated, self.dim_x);
-        let second_moment = propagated.transpose() * &propagated * w;
-        let cov = symmetrize(&(second_moment - (&mean * mean.transpose()) + &self.q));
+        let second_moment = propagated.tr_mul(&propagated) * w;
+        let mut cov = second_moment - &mean * mean.transpose() + &self.q;
+        symmetrize_in_place(&mut cov);
 
         self.x = mean;
         self.p = cov;
@@ -307,18 +384,47 @@ impl CubatureKalmanFilter {
         Ok(())
     }
 
+    /// Compute log-likelihood using the Cholesky factor of S. This is both
+    /// faster than `lu().determinant()` and more numerically robust: if S is
+    /// not positive-definite (which can happen after many updates if R is
+    /// tiny relative to drift), we bail to a clear `-inf` rather than risk
+    /// a near-zero or negative determinant.
     fn update_likelihood_terms(&mut self) {
-        let det = self.s.clone().lu().determinant();
-        if !det.is_finite() || det <= 0.0 {
+        let mahal2 = (self.y.transpose() * &self.si * &self.y)[(0, 0)];
+        self.nis = mahal2.max(0.0);
+        self.mahalanobis = self.nis.sqrt();
+
+        if let Some(chol) = self.s.clone().cholesky() {
+            // log det(S) = 2 * sum(log(diag(L)))
+            let l = chol.l();
+            let mut log_det = 0.0;
+            for i in 0..l.nrows() {
+                let d = l[(i, i)];
+                if d <= 0.0 || !d.is_finite() {
+                    self.log_likelihood = f64::NEG_INFINITY;
+                    self.likelihood = 0.0;
+                    return;
+                }
+                log_det += d.ln();
+            }
+            log_det *= 2.0;
+            self.log_likelihood = -0.5 * ((self.dim_z as f64) * (2.0 * PI).ln() + log_det + mahal2);
+            self.likelihood = self.log_likelihood.exp();
+        } else {
             self.log_likelihood = f64::NEG_INFINITY;
             self.likelihood = 0.0;
-            self.mahalanobis = f64::INFINITY;
-            return;
         }
-        let mahal2 = (self.y.transpose() * &self.si * &self.y)[(0, 0)];
-        self.mahalanobis = mahal2.max(0.0).sqrt();
-        self.log_likelihood = -0.5 * ((self.dim_z as f64) * (2.0 * PI).ln() + det.ln() + mahal2);
-        self.likelihood = self.log_likelihood.exp();
+    }
+
+    #[inline]
+    fn record_jitter(&mut self, jitter: f64) {
+        self.last_jitter = jitter;
+        if jitter > 0.0 {
+            self.jitter_count = self.jitter_count.saturating_add(1);
+            if jitter > self.max_jitter {
+                self.max_jitter = jitter;
+            }
+        }
     }
 }
 
@@ -351,7 +457,7 @@ fn call_model_vectorized(
 fn transition_matrix(model_type: &str, dim_x: usize, dt: f64) -> PyResult<DMatrix<f64>> {
     match model_type {
         "constant_velocity" => {
-            if dim_x % 2 != 0 {
+            if !dim_x.is_multiple_of(2) {
                 return Err(PyValueError::new_err(
                     "constant_velocity requires even dim_x with [pos..., vel...] layout",
                 ));
@@ -364,7 +470,7 @@ fn transition_matrix(model_type: &str, dim_x: usize, dt: f64) -> PyResult<DMatri
             Ok(f)
         }
         "constant_acceleration" => {
-            if dim_x % 3 != 0 {
+            if !dim_x.is_multiple_of(3) {
                 return Err(PyValueError::new_err(
                     "constant_acceleration requires dim_x multiple of 3 with [pos..., vel..., acc...] layout",
                 ));
@@ -378,28 +484,36 @@ fn transition_matrix(model_type: &str, dim_x: usize, dt: f64) -> PyResult<DMatri
             }
             Ok(f)
         }
-        _ => Err(PyValueError::new_err(format!("unsupported model_type: {model_type}"))),
+        _ => Err(PyValueError::new_err(format!(
+            "unsupported model_type: {model_type}"
+        ))),
     }
 }
 
-fn cubature_points(x: &DVector<f64>, p: &DMatrix<f64>) -> PyResult<DMatrix<f64>> {
+#[inline]
+fn cubature_points(x: &DVector<f64>, p: &DMatrix<f64>) -> PyResult<(DMatrix<f64>, f64)> {
     let n = x.nrows();
-    let chol = stable_cholesky(p)?;
+    let (chol, applied_jitter) = stable_cholesky(p)?;
     let scale = (n as f64).sqrt();
 
     let mut sigma = DMatrix::<f64>::zeros(2 * n, n);
     for k in 0..n {
         for j in 0..n {
-            // Match FilterPy's scipy-based upper-triangular convention.
+            // chol is the lower-triangular L from p.cholesky(). Indexing
+            // chol[(j, k)] effectively reads the column of L^T, which is the
+            // convention used by FilterPy's scipy-based reference.
             let offset = scale * chol[(j, k)];
             sigma[(k, j)] = x[j] + offset;
             sigma[(n + k, j)] = x[j] - offset;
         }
     }
-    Ok(sigma)
+    Ok((sigma, applied_jitter))
 }
 
-fn stable_cholesky(p: &DMatrix<f64>) -> PyResult<DMatrix<f64>> {
+/// Returns the Cholesky factor of `p` plus any jitter that had to be added to
+/// the diagonal to make the decomposition succeed. Callers should record the
+/// jitter so the user can see when P is silently being conditioned.
+fn stable_cholesky(p: &DMatrix<f64>) -> PyResult<(DMatrix<f64>, f64)> {
     let n = p.nrows();
     let eye = DMatrix::<f64>::identity(n, n);
     let mut jitter = 0.0_f64;
@@ -407,11 +521,13 @@ fn stable_cholesky(p: &DMatrix<f64>) -> PyResult<DMatrix<f64>> {
     for _ in 0..8 {
         let candidate = p + eye.scale(jitter);
         if let Some(chol) = candidate.cholesky() {
-            return Ok(chol.l());
+            return Ok((chol.l(), jitter));
         }
         jitter = if jitter == 0.0 { 1e-12 } else { jitter * 10.0 };
     }
-    Err(PyRuntimeError::new_err("unable to compute stable Cholesky factor"))
+    Err(PyRuntimeError::new_err(
+        "unable to compute stable Cholesky factor",
+    ))
 }
 
 fn magnetic_reference_terms(z: &DVector<f64>) -> PyResult<(f64, f64)> {
@@ -447,29 +563,70 @@ fn paper_observation_model(sigma: &DMatrix<f64>, m_n: f64, m_d: f64) -> DMatrix<
         out[(i, 0)] = 2.0 * (q1 * q3 - q0 * q2);
         out[(i, 1)] = 2.0 * (q2 * q3 + q0 * q1);
         out[(i, 2)] = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3;
-        out[(i, 3)] = (q0 * q0 + q1 * q1 - q2 * q2 - q3 * q3) * m_n + 2.0 * (q1 * q3 - q0 * q2) * m_d;
+        out[(i, 3)] =
+            (q0 * q0 + q1 * q1 - q2 * q2 - q3 * q3) * m_n + 2.0 * (q1 * q3 - q0 * q2) * m_d;
         out[(i, 4)] = 2.0 * (q1 * q2 - q0 * q3) * m_n + 2.0 * (q2 * q3 + q0 * q1) * m_d;
-        out[(i, 5)] = 2.0 * (q1 * q3 + q0 * q2) * m_n + (q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3) * m_d;
+        out[(i, 5)] =
+            2.0 * (q1 * q3 + q0 * q2) * m_n + (q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3) * m_d;
     }
     out
 }
 
+#[inline]
 fn row_mean(values: &DMatrix<f64>, dim: usize) -> DVector<f64> {
-    let mut mean = DVector::<f64>::zeros(dim);
     let w = 1.0 / (values.nrows() as f64);
-    for i in 0..values.nrows() {
-        for j in 0..dim {
-            mean[j] += w * values[(i, j)];
+    let mut mean = DVector::<f64>::zeros(dim);
+    // values is (M, dim); sum each column then scale.
+    for j in 0..dim {
+        let mut acc = 0.0;
+        for i in 0..values.nrows() {
+            acc += values[(i, j)];
         }
+        mean[j] = acc * w;
     }
     mean
 }
 
-fn symmetrize(mat: &DMatrix<f64>) -> DMatrix<f64> {
-    (mat + mat.transpose()) * 0.5
+#[inline]
+fn symmetrize_in_place(mat: &mut DMatrix<f64>) {
+    let n = mat.nrows();
+    debug_assert_eq!(
+        n,
+        mat.ncols(),
+        "symmetrize_in_place requires a square matrix"
+    );
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let avg = 0.5 * (mat[(i, j)] + mat[(j, i)]);
+            mat[(i, j)] = avg;
+            mat[(j, i)] = avg;
+        }
+    }
 }
 
-fn pyarray1_to_dvector(arr: PyReadonlyArray1<f64>, expected: usize, name: &str) -> PyResult<DVector<f64>> {
+/// Invert the innovation covariance S. Returns (S^-1, was_singular). When S
+/// is singular we fall back to the Moore-Penrose pseudo-inverse; callers
+/// should bump a counter so the user can see this happened.
+fn invert_innovation(s: &DMatrix<f64>) -> PyResult<(DMatrix<f64>, bool)> {
+    if let Some(chol) = s.clone().cholesky() {
+        return Ok((chol.inverse(), false));
+    }
+    if let Some(inv) = s.clone().try_inverse() {
+        return Ok((inv, true));
+    }
+    let pinv = s
+        .clone()
+        .svd(true, true)
+        .pseudo_inverse(1e-12)
+        .map_err(|_| PyRuntimeError::new_err("failed to invert innovation covariance"))?;
+    Ok((pinv, true))
+}
+
+fn pyarray1_to_dvector(
+    arr: PyReadonlyArray1<f64>,
+    expected: usize,
+    name: &str,
+) -> PyResult<DVector<f64>> {
     if arr.shape()[0] != expected {
         return Err(PyValueError::new_err(format!(
             "{name} must have length {expected}, got {}",
@@ -494,25 +651,30 @@ fn pyarray2_to_dmatrix(
         )));
     }
     let data = arr.as_array();
-    let mut out = DMatrix::<f64>::zeros(expected_rows, expected_cols);
-    for i in 0..expected_rows {
-        for j in 0..expected_cols {
-            out[(i, j)] = data[(i, j)];
-        }
-    }
-    Ok(out)
+    // ndarray default iteration is row-major; nalgebra needs row-major
+    // input via `from_row_iterator`. Avoids the previous (i,j) double loop.
+    Ok(DMatrix::<f64>::from_row_iterator(
+        expected_rows,
+        expected_cols,
+        data.iter().copied(),
+    ))
 }
 
 fn dmatrix_to_pyarray<'py>(py: Python<'py>, mat: &DMatrix<f64>) -> PyResult<&'py PyArray2<f64>> {
-    let mut rows: Vec<Vec<f64>> = Vec::with_capacity(mat.nrows());
-    for i in 0..mat.nrows() {
-        let mut row: Vec<f64> = Vec::with_capacity(mat.ncols());
-        for j in 0..mat.ncols() {
-            row.push(mat[(i, j)]);
+    let rows = mat.nrows();
+    let cols = mat.ncols();
+    // Build a single Vec in row-major order (no per-row allocations) then
+    // hand it to ndarray::Array2::from_shape_vec; ToPyArray copies into a
+    // fresh numpy buffer. One alloc instead of `rows + 1`.
+    let mut data: Vec<f64> = Vec::with_capacity(rows * cols);
+    for i in 0..rows {
+        for j in 0..cols {
+            data.push(mat[(i, j)]);
         }
-        rows.push(row);
     }
-    PyArray2::from_vec2(py, &rows).map_err(|_| PyRuntimeError::new_err("failed to create numpy matrix"))
+    let arr = numpy::ndarray::Array2::from_shape_vec((rows, cols), data)
+        .map_err(|_| PyRuntimeError::new_err("failed to build numpy matrix shape"))?;
+    Ok(arr.to_pyarray(py))
 }
 
 #[pymodule]
