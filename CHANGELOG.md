@@ -87,7 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sequential Rust per-step loop takes ~125 ms; one parallel step takes
   ~1.8 ms — **~70x speedup** on M-class Apple silicon (8 performance
   cores plus per-filter parallelism amortizing FFI / Python overhead).
-  The audit's "at least 4x" target is well exceeded.
+  The "at least 4x" target is well exceeded.
 
 ### Notes
 - Scope deliberately kept to the linear path (`predict_linear_model` +
@@ -160,7 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance
 - 10,000-step linear CV filter: 118 ms sequential (Python ↔ Rust per
   step) → 5.3 ms via `batch_filter` — **~22x speedup** on M-class
-  Apple silicon, validating the audit's "order of magnitude" target.
+  Apple silicon, comfortably clearing the "order of magnitude" target.
 
 ## [0.3.0] - 2026-05-21
 
@@ -202,7 +202,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PEP 561 `turbo_ckf/py.typed` marker.
 - `CONTRIBUTING.md`, `Makefile`, `.github/dependabot.yml`, and
   `.github/PULL_REQUEST_TEMPLATE.md`.
-- `AUDIT.md` capturing the four-agent repo audit and Session 1 status.
 - README install badges, `pip install turbo-ckf` quick-start.
 
 ### Changed
