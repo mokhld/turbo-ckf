@@ -2,4 +2,5 @@ numpy
 filterpy
 pytest
 pytest-benchmark
+pytest-cov
 maturin
