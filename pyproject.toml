@@ -36,6 +36,7 @@ dev = [
   "filterpy",
   "pytest",
   "pytest-benchmark",
+  "pytest-cov",
   "maturin",
 ]
 
@@ -49,3 +50,13 @@ module-name = "turbo_ckf._rust"
 python-source = "."
 features = ["pyo3/extension-module"]
 include = ["turbo_ckf/py.typed"]
+
+[tool.coverage.run]
+source = ["turbo_ckf"]
+
+[tool.coverage.report]
+# CI enforces a ratchet floor via --cov-fail-under (currently 95; the real
+# baseline is 100% on the Python layer). Raise the floor — never lower it —
+# when coverage rises durably. The Rust backend (src/lib.rs) is covered by the
+# cargo test/clippy jobs, not this Python-layer gate.
+show_missing = true
