@@ -102,6 +102,17 @@ impl CubatureKalmanFilter {
         Ok(())
     }
 
+    /// Update the default time step used by predict_standard_model[_ckf]
+    /// and by predict_custom when no per-call dt is given.
+    #[pyo3(signature = (dt))]
+    fn set_dt(&mut self, dt: f64) -> PyResult<()> {
+        if !dt.is_finite() {
+            return Err(PyValueError::new_err("dt must be finite"));
+        }
+        self.dt = dt;
+        Ok(())
+    }
+
     #[pyo3(signature = (fx, dt=None, fx_args=None))]
     fn predict_custom(
         &mut self,
@@ -203,6 +214,7 @@ impl CubatureKalmanFilter {
         hx_args: Option<&PyTuple>,
     ) -> PyResult<()> {
         let z_vec = pyarray1_to_dvector(z, self.dim_z, "z")?;
+        require_finite_measurement(&z_vec)?;
         let r_mat = if let Some(mat) = r {
             pyarray2_to_dmatrix(mat, self.dim_z, self.dim_z, "R")?
         } else {
@@ -269,6 +281,7 @@ impl CubatureKalmanFilter {
             ));
         }
         let z_vec = pyarray1_to_dvector(z, self.dim_z, "z")?;
+        require_finite_measurement(&z_vec)?;
         let (m_n, m_d) = magnetic_reference_terms(&z_vec)?;
 
         let (sigma, jitter) = cubature_points(&self.x, &self.p)?;
@@ -606,6 +619,22 @@ fn symmetrize_in_place(mat: &mut DMatrix<f64>) {
             mat[(j, i)] = avg;
         }
     }
+}
+
+/// Reject NaN/inf measurements before they reach the filter equations.
+/// A single non-finite element would propagate into x and P and only
+/// surface one step later as a Cholesky failure.
+fn require_finite_measurement(z: &DVector<f64>) -> PyResult<()> {
+    if z.iter().all(|v| v.is_finite()) {
+        return Ok(());
+    }
+    Err(PyValueError::new_err(format!(
+        "z contains non-finite values: {:?}. A NaN/inf measurement would \
+         silently corrupt the filter state. For a missed measurement skip \
+         this update; update() also accepts z=None, which skips the step \
+         and clears the innovation diagnostics.",
+        z.as_slice()
+    )))
 }
 
 /// Invert the innovation covariance S. Returns (S^-1, was_singular). When S
@@ -1343,6 +1372,17 @@ impl SquareRootCubatureKalmanFilter {
         Ok(())
     }
 
+    /// Update the default time step used by predict_custom when no per-call
+    /// dt is given.
+    #[pyo3(signature = (dt))]
+    fn set_dt(&mut self, dt: f64) -> PyResult<()> {
+        if !dt.is_finite() {
+            return Err(PyValueError::new_err("dt must be finite"));
+        }
+        self.dt = dt;
+        Ok(())
+    }
+
     #[pyo3(signature = (fx, dt=None, fx_args=None))]
     fn predict_custom(
         &mut self,
@@ -1423,6 +1463,7 @@ impl SquareRootCubatureKalmanFilter {
         let n = self.dim_x;
         let m_dim = self.dim_z;
         let z_vec = pyarray1_to_dvector(z, m_dim, "z")?;
+        require_finite_measurement(&z_vec)?;
         let chol_r_local = if let Some(mat) = r {
             let r_mat = pyarray2_to_dmatrix(mat, m_dim, m_dim, "R")?;
             let (chol_r, jitter) = stable_cholesky(&r_mat)?;

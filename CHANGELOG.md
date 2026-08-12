@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-12
+
+### Added
+- `TurboCKF.run(zs, dts=None, Rs=None, fx_args=(), hx_args=(),
+  nan_means_missing=False)` and the same method on `TurboSRCKF`: runs the
+  predict+update loop over a whole measurement sequence in one call and
+  returns a `FilterRun` named tuple with stacked `xs`, `Ps`, `x_priors`,
+  `P_priors`, `log_likelihoods`, `nis`, and a `missing` mask. `None`
+  entries (or all-NaN rows with `nan_means_missing=True`) skip the update
+  for that step. Input shapes are validated up front, before the filter
+  advances. `FilterRun` is exported from the package root.
+- Coercing property setters for `x`, `P`, `Q`, `R` on both filters: plain
+  lists, integer arrays, and column/row vectors are accepted for `x`;
+  scalars (`kf.R = 0.25`), 1-D diagonals, and full matrices for the
+  covariances. Wrong sizes and non-finite values raise `ValueError` at
+  assignment time with the attribute named, instead of surfacing later as
+  an opaque pyo3 conversion error inside `predict()`.
+
+### Fixed
+- Assigning `kf.dt` after construction is now honored by
+  `predict_standard_model[_ckf]` and the default `dt` of the backend
+  predict paths. Previously the Rust backend kept the constructor-time
+  `dt` forever, so a mid-run rate change silently produced wrong
+  transition matrices. Both backends grew a `set_dt` method and the
+  wrapper pushes `dt` alongside the rest of the state.
+- `update(z)` with NaN/inf in `z` now raises a `ValueError` pointing at
+  the `z=None` dropout path. Previously a NaN measurement silently set the
+  whole state to NaN and the *next* update died with "unable to compute
+  stable Cholesky factor". The check runs backend-side (also covering
+  `update_paper_ahrs` and `TurboSRCKF.update`) so the hot loop pays
+  nothing measurable for it.
+- `make build` no longer passes `-m pyproject.toml` to maturin; current
+  maturin releases interpret `-m` as the Cargo manifest path and the
+  target failed outright.
+
 ## [0.7.0] - 2026-05-21
 
 ### Added
@@ -268,7 +303,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - KCKF-style AHRS update path from Yamagishi and Jing (arXiv:2602.12283).
 - Parity tests against FilterPy and benchmark scripts.
 
-[Unreleased]: https://github.com/mokhld/turbo-ckf/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/mokhld/turbo-ckf/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/mokhld/turbo-ckf/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/mokhld/turbo-ckf/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/mokhld/turbo-ckf/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mokhld/turbo-ckf/compare/v0.4.0...v0.5.0

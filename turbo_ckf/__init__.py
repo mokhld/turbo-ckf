@@ -1,6 +1,6 @@
 """Turbo CKF package."""
 
-from .core import TurboCKF, TurboSRCKF
+from .core import FilterRun, TurboCKF, TurboSRCKF
 from .paper_ahrs import (
     magnetic_reference_terms,
     measurement_noise,
@@ -15,6 +15,7 @@ batch_filter = TurboCKF.batch_filter
 batch_parallel_step = TurboCKF.batch_parallel_step
 
 __all__ = [
+    "FilterRun",
     "TurboCKF",
     "TurboSRCKF",
     "batch_filter",
