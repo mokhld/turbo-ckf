@@ -67,6 +67,40 @@ kf.predict_standard_model("constant_velocity")
 kf.update(z)
 ```
 
+State assignment is forgiving about spelling: `x` accepts lists, integer
+arrays, and column vectors; `P`, `Q`, `R` accept scalars (`kf.R = 0.25` means
+`0.25 * I`), 1-D diagonals (`kf.Q = [1e-3, 1e-2]`), or full matrices. Wrong
+sizes and non-finite values raise at assignment time with the attribute named
+in the error. Changing `kf.dt` after construction takes effect on the next
+predict, including the standard/linear-model paths.
+
+A NaN or inf measurement raises instead of corrupting the state. For a missed
+measurement pass `z=None`, which runs the predict-only step and clears the
+innovation diagnostics.
+
+### Filtering a whole sequence
+
+`run(...)` wraps the predict/update loop, stacks the per-step outputs, and
+handles measurement dropouts:
+
+```python
+result = kf.run(zs)                # zs: (N, dim_z), or (N,) when dim_z == 1
+result.xs, result.Ps               # posterior means / covariances, stacked
+result.log_likelihoods, result.nis # per-step diagnostics
+
+# Missed measurements: None entries (or all-NaN rows with
+# nan_means_missing=True) skip the update for that step.
+kf.run([z0, None, z2])
+kf.run(zs, nan_means_missing=True)
+
+# Per-step time steps and measurement noise:
+kf.run(zs, dts=dt_array, Rs=r_stack)
+```
+
+`run` is available on both `TurboCKF` and `TurboSRCKF`. For linear models
+prefer the static `TurboCKF.batch_filter`, which runs the whole loop inside
+Rust in a single crossing.
+
 AHRS path:
 
 ```python

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -21,6 +21,208 @@ except Exception as exc:  # pragma: no cover
 _STANDARD_MODELS = tuple(_rust.CubatureKalmanFilter.supported_standard_models())
 
 _ADAPTIVE_MODES = ("R", "Q", "both")
+
+
+def _coerce_state_vector(value: npt.ArrayLike, size: int, name: str) -> Vector:
+    """Coerce a state-vector assignment to a float64 1-D array of ``size``.
+
+    Accepts lists/tuples, integer arrays, and ``(size, 1)`` / ``(1, size)``
+    column/row vectors. Rejects wrong sizes and non-finite values with an
+    error that names the attribute, so mistakes surface at assignment time
+    instead of as a pyo3 conversion error inside the next predict().
+    """
+
+    try:
+        arr = np.asarray(value, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            f"{name} must be array-like of floats; got {type(value).__name__}"
+        ) from exc
+    if arr.ndim == 2 and 1 in arr.shape:
+        arr = arr.reshape(-1)
+    if arr.ndim != 1 or arr.shape[0] != size:
+        raise ValueError(
+            f"{name} must be a length-{size} vector (shape ({size},), "
+            f"({size}, 1), or (1, {size})); got shape {arr.shape}"
+        )
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must contain only finite values; got {arr!r}")
+    return np.ascontiguousarray(arr)
+
+
+def _coerce_square_matrix(value: npt.ArrayLike, size: int, name: str) -> Matrix:
+    """Coerce a covariance-style assignment to a float64 ``(size, size)`` array.
+
+    Accepts a scalar (``s * I``), a length-``size`` 1-D array (diagonal), or a
+    full ``(size, size)`` matrix — in any dtype/nested-list spelling. Rejects
+    wrong shapes and non-finite values with an error that names the attribute.
+    """
+
+    try:
+        arr = np.asarray(value, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            f"{name} must be a scalar or array-like of floats; got {type(value).__name__}"
+        ) from exc
+    if arr.ndim == 0:
+        arr = float(arr) * np.eye(size, dtype=float)
+    elif arr.ndim == 1:
+        if arr.shape[0] != size:
+            raise ValueError(
+                f"1-D {name} is interpreted as a diagonal and must have "
+                f"length {size}; got shape {arr.shape}"
+            )
+        arr = np.diag(arr)
+    elif arr.shape != (size, size):
+        raise ValueError(
+            f"{name} must be a scalar, a length-{size} diagonal, or a "
+            f"({size}, {size}) matrix; got shape {arr.shape}"
+        )
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must contain only finite values")
+    return np.ascontiguousarray(arr)
+
+
+class FilterRun(NamedTuple):
+    """Stacked per-step outputs of :meth:`TurboCKF.run` / :meth:`TurboSRCKF.run`.
+
+    ``log_likelihoods`` and ``nis`` are NaN at steps where the measurement
+    was missing (the update was skipped); ``missing`` is the boolean mask of
+    those steps.
+    """
+
+    xs: Matrix
+    Ps: npt.NDArray[np.float64]
+    x_priors: Matrix
+    P_priors: npt.NDArray[np.float64]
+    log_likelihoods: Vector
+    nis: Vector
+    missing: npt.NDArray[np.bool_]
+
+
+def _normalize_run_measurements(
+    zs: Any, dim_z: int, nan_means_missing: bool
+) -> list[Vector | None]:
+    """Validate/normalize a measurement sequence for run() up front, so shape
+    errors raise before the filter has advanced a single step."""
+
+    if isinstance(zs, np.ndarray) and zs.dtype != object:
+        arr = np.asarray(zs, dtype=float)
+        if arr.ndim == 1 and dim_z == 1:
+            arr = arr.reshape(-1, 1)
+        if arr.ndim != 2 or arr.shape[1] != dim_z:
+            raise ValueError(
+                f"zs must have shape (N, {dim_z})"
+                + (" or (N,)" if dim_z == 1 else "")
+                + f"; got shape {np.asarray(zs).shape}"
+            )
+        entries: list[Vector | None] = [np.ascontiguousarray(row) for row in arr]
+    else:
+        entries = []
+        for i, z in enumerate(zs):
+            if z is None:
+                entries.append(None)
+                continue
+            row = np.asarray(z, dtype=float).reshape(-1)
+            if row.shape[0] != dim_z:
+                raise ValueError(
+                    f"zs[{i}] must have length {dim_z}; got shape "
+                    f"{np.asarray(z).shape}"
+                )
+            entries.append(row)
+    if not entries:
+        raise ValueError("zs must contain at least one measurement")
+
+    out: list[Vector | None] = []
+    for i, row in enumerate(entries):
+        if row is None or np.all(np.isfinite(row)):
+            out.append(row)
+        elif nan_means_missing and np.all(np.isnan(row)):
+            out.append(None)
+        else:
+            raise ValueError(
+                f"zs[{i}] contains non-finite values: {row!r}. Use None "
+                "entries (or all-NaN rows with nan_means_missing=True) to "
+                "mark missed measurements."
+            )
+    return out
+
+
+def _normalize_run_dts(dts: Any, n: int) -> list[float | None]:
+    if dts is None:
+        return [None] * n
+    arr = np.asarray(dts, dtype=float)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("dts must contain only finite values")
+    if arr.ndim == 0:
+        return [float(arr)] * n
+    if arr.shape == (n,):
+        return [float(v) for v in arr]
+    raise ValueError(f"dts must be a scalar or have shape ({n},); got shape {arr.shape}")
+
+
+def _normalize_run_covariances(Rs: Any, n: int, dim_z: int) -> list[Matrix | None]:
+    if Rs is None:
+        return [None] * n
+    if isinstance(Rs, np.ndarray) and Rs.ndim == 3:
+        if Rs.shape != (n, dim_z, dim_z):
+            raise ValueError(
+                f"3-D Rs must have shape ({n}, {dim_z}, {dim_z}); got shape {Rs.shape}"
+            )
+        return [_coerce_square_matrix(m, dim_z, f"Rs[{i}]") for i, m in enumerate(Rs)]
+    if isinstance(Rs, (list, tuple)):
+        if len(Rs) != n:
+            raise ValueError(
+                f"list/tuple Rs must have one entry per measurement ({n}); got {len(Rs)}"
+            )
+        return [_coerce_square_matrix(m, dim_z, f"Rs[{i}]") for i, m in enumerate(Rs)]
+    # Scalar or single (dim_z, dim_z) matrix: shared across all steps.
+    shared = _coerce_square_matrix(Rs, dim_z, "Rs")
+    return [shared] * n
+
+
+def _run_filter(
+    kf: "TurboCKF | TurboSRCKF",
+    zs: Any,
+    dts: Any,
+    Rs: Any,
+    fx_args: Sequence[object] | object,
+    hx_args: Sequence[object] | object,
+    nan_means_missing: bool,
+) -> FilterRun:
+    entries = _normalize_run_measurements(zs, kf.dim_z, nan_means_missing)
+    n = len(entries)
+    step_dts = _normalize_run_dts(dts, n)
+    step_rs = _normalize_run_covariances(Rs, n, kf.dim_z)
+
+    xs = np.empty((n, kf.dim_x), dtype=float)
+    ps = np.empty((n, kf.dim_x, kf.dim_x), dtype=float)
+    x_priors = np.empty((n, kf.dim_x), dtype=float)
+    p_priors = np.empty((n, kf.dim_x, kf.dim_x), dtype=float)
+    lls = np.empty(n, dtype=float)
+    nis = np.empty(n, dtype=float)
+    missing = np.zeros(n, dtype=bool)
+
+    for i, z in enumerate(entries):
+        kf.predict(dt=step_dts[i], fx_args=fx_args)
+        kf.update(z, R=step_rs[i], hx_args=hx_args)
+        xs[i] = kf.x_post
+        ps[i] = kf.P_post
+        x_priors[i] = kf.x_prior
+        p_priors[i] = kf.P_prior
+        lls[i] = kf.log_likelihood
+        nis[i] = kf.nis
+        missing[i] = z is None
+
+    return FilterRun(
+        xs=xs,
+        Ps=ps,
+        x_priors=x_priors,
+        P_priors=p_priors,
+        log_likelihoods=lls,
+        nis=nis,
+        missing=missing,
+    )
 
 
 class _AdaptiveNoiseEstimator:
@@ -184,7 +386,85 @@ class _AdaptiveNoiseEstimator:
         return est
 
 
-class TurboCKF:
+class _ValidatedStateMixin:
+    """Coercing property views over the core filter state.
+
+    ``x``, ``P``, ``Q``, ``R`` and ``dt`` accept the spellings people
+    actually write (plain lists, integer arrays, column vectors, scalars or
+    diagonals for covariances) and normalize them to the float64 layouts the
+    Rust backend needs. Invalid shapes, sizes, and non-finite values raise
+    at assignment time with the attribute name in the message, rather than
+    surfacing later as an opaque conversion error inside predict()/update().
+    """
+
+    dim_x: int
+    dim_z: int
+
+    @property
+    def x(self) -> Vector:
+        """State mean, shape ``(dim_x,)``."""
+
+        return self._x
+
+    @x.setter
+    def x(self, value: npt.ArrayLike) -> None:
+        self._x = _coerce_state_vector(value, self.dim_x, "x")
+
+    @property
+    def P(self) -> Matrix:
+        """State covariance, shape ``(dim_x, dim_x)``."""
+
+        return self._P
+
+    @P.setter
+    def P(self, value: npt.ArrayLike) -> None:
+        self._P = _coerce_square_matrix(value, self.dim_x, "P")
+
+    @property
+    def Q(self) -> Matrix:
+        """Process-noise covariance, shape ``(dim_x, dim_x)``."""
+
+        return self._Q
+
+    @Q.setter
+    def Q(self, value: npt.ArrayLike) -> None:
+        self._Q = _coerce_square_matrix(value, self.dim_x, "Q")
+
+    @property
+    def R(self) -> Matrix:
+        """Measurement-noise covariance, shape ``(dim_z, dim_z)``."""
+
+        return self._R
+
+    @R.setter
+    def R(self, value: npt.ArrayLike) -> None:
+        self._R = _coerce_square_matrix(value, self.dim_z, "R")
+
+    @property
+    def dt(self) -> float:
+        """Default time step. Assignments are pushed straight to the Rust
+        backend, so ``kf.dt = ...`` takes effect for every predict path
+        (including the standard/linear-model predicts, which read dt
+        backend-side)."""
+
+        return self._dt
+
+    @dt.setter
+    def dt(self, value: float) -> None:
+        val = float(value)
+        if not np.isfinite(val):
+            raise ValueError("dt must be finite")
+        self._dt = val
+        # The backend does not exist yet during __init__; the constructors
+        # pass dt through, so the two stay in sync either way. Pushing here
+        # (instead of on every predict/update) keeps the hot loop free of an
+        # extra FFI call.
+        backend = getattr(self, "_rust_backend", None)
+        if backend is not None:
+            backend.set_dt(val)
+
+
+class TurboCKF(_ValidatedStateMixin):
     """Rust-backed Cubature Kalman Filter.
 
     Callback contract for ``fx`` and ``hx``: both must accept a batch of
@@ -380,6 +660,60 @@ class TurboCKF:
         self._rust_backend.update_paper_ahrs(z_vec, sigma_acc2, sigma_mag2)
         self._pull_state_from_backend()
         return self.x
+
+    def run(
+        self,
+        zs: npt.ArrayLike | Sequence[npt.ArrayLike | None],
+        dts: npt.ArrayLike | None = None,
+        Rs: npt.ArrayLike | None = None,
+        fx_args: Sequence[object] | object = (),
+        hx_args: Sequence[object] | object = (),
+        nan_means_missing: bool = False,
+    ) -> FilterRun:
+        """Run predict+update over a whole measurement sequence in one call.
+
+        Equivalent to the hand-written loop, with history collection and
+        missed-measurement handling built in::
+
+            result = kf.run(zs)
+            result.xs       # (N, dim_x) posterior means
+            result.Ps       # (N, dim_x, dim_x) posterior covariances
+
+        The filter instance is mutated step by step exactly as if
+        :meth:`predict` and :meth:`update` had been called in a loop, so the
+        final state is available on ``self`` afterwards, and features like
+        adaptive noise keep working. All input validation happens up front —
+        a shape error raises before the filter has advanced at all.
+
+        For *linear* models prefer the static :meth:`batch_filter`, which
+        runs the whole loop inside Rust in a single crossing.
+
+        Args:
+            zs: measurement sequence. Either an ``(N, dim_z)`` array
+                (``(N,)`` is also accepted when ``dim_z == 1``), or a list
+                whose entries are length-``dim_z`` vectors (scalars when
+                ``dim_z == 1``) or ``None`` for a missed measurement. A
+                ``None`` entry runs the predict step and skips the update.
+            dts: optional per-step time steps — a scalar or an ``(N,)``
+                array. Defaults to ``self.dt`` for every step.
+            Rs: optional measurement noise — a scalar or ``(dim_z, dim_z)``
+                matrix shared by all steps, or an ``(N, dim_z, dim_z)``
+                array / length-``N`` list for per-step values. Defaults to
+                ``self.R``.
+            fx_args: extra positional args forwarded to ``fx`` each step.
+            hx_args: extra positional args forwarded to ``hx`` each step.
+            nan_means_missing: when True, rows of ``zs`` that are entirely
+                NaN are treated as missed measurements instead of raising.
+                Rows with a *mix* of NaN and finite values always raise.
+
+        Returns:
+            :class:`FilterRun` with stacked ``xs``, ``Ps``, ``x_priors``,
+            ``P_priors``, ``log_likelihoods``, ``nis``, and the boolean
+            ``missing`` mask. Likelihood/NIS entries are NaN at missed
+            steps.
+        """
+
+        return _run_filter(self, zs, dts, Rs, fx_args, hx_args, nan_means_missing)
 
     # ----- diagnostics / utility ------------------------------------------
 
@@ -910,18 +1244,20 @@ class TurboCKF:
     # ----- internals -------------------------------------------------------
 
     def _push_state_to_backend(self) -> None:
-        self._rust_backend.set_state(self.x, self.P, self.Q, self.R)
+        self._rust_backend.set_state(self._x, self._P, self._Q, self._R)
 
     def _pull_state_from_backend(self) -> None:
         # The Rust snapshot already returns fresh numpy buffers (via
         # `ToPyArray::to_pyarray`, which allocates a new PyArray per call),
         # so `np.asarray` here is a zero-copy adoption — no aliasing risk to
-        # the backend struct's internal storage.
+        # the backend struct's internal storage. Writes go to the private
+        # slots directly: backend output is already float64 and well-shaped,
+        # so the coercing property setters would only add per-step overhead.
         snap = self._rust_backend.snapshot()
-        self.x = np.asarray(snap["x"], dtype=float).reshape(-1)
-        self.P = np.asarray(snap["P"], dtype=float)
-        self.Q = np.asarray(snap["Q"], dtype=float)
-        self.R = np.asarray(snap["R"], dtype=float)
+        self._x = np.asarray(snap["x"], dtype=float).reshape(-1)
+        self._P = np.asarray(snap["P"], dtype=float)
+        self._Q = np.asarray(snap["Q"], dtype=float)
+        self._R = np.asarray(snap["R"], dtype=float)
         self.K = np.asarray(snap["K"], dtype=float)
         self.y = np.asarray(snap["y"], dtype=float).reshape(-1)
         self.z = np.asarray(snap["z"], dtype=float).reshape(-1)
@@ -1106,7 +1442,7 @@ class TurboCKF:
         return (args,)
 
 
-class TurboSRCKF:
+class TurboSRCKF(_ValidatedStateMixin):
     """Square-root Cubature Kalman Filter (SR-CKF).
 
     Propagates the lower-triangular Cholesky factor of P directly instead of
@@ -1260,6 +1596,24 @@ class TurboSRCKF:
         self._pull_state_from_backend()
         return self.x
 
+    def run(
+        self,
+        zs: npt.ArrayLike | Sequence[npt.ArrayLike | None],
+        dts: npt.ArrayLike | None = None,
+        Rs: npt.ArrayLike | None = None,
+        fx_args: Sequence[object] | object = (),
+        hx_args: Sequence[object] | object = (),
+        nan_means_missing: bool = False,
+    ) -> FilterRun:
+        """Run predict+update over a whole measurement sequence in one call.
+
+        Same contract as :meth:`TurboCKF.run` — see that docstring for the
+        accepted ``zs``/``dts``/``Rs`` spellings and missed-measurement
+        handling.
+        """
+
+        return _run_filter(self, zs, dts, Rs, fx_args, hx_args, nan_means_missing)
+
     # ----- diagnostics / utility ------------------------------------------
 
     def gate(self, threshold: float) -> bool:
@@ -1323,17 +1677,20 @@ class TurboSRCKF:
     # ----- internals -------------------------------------------------------
 
     def _push_state_to_backend(self) -> None:
-        self._rust_backend.set_state(self.x, self.P, self.Q, self.R)
+        self._rust_backend.set_state(self._x, self._P, self._Q, self._R)
 
     def _pull_state_from_backend(self) -> None:
+        # Private-slot writes: backend output is already float64 and
+        # well-shaped, so the coercing property setters would only add
+        # per-step overhead.
         snap = self._rust_backend.snapshot()
-        self.x = np.asarray(snap["x"], dtype=float).reshape(-1)
+        self._x = np.asarray(snap["x"], dtype=float).reshape(-1)
         self.chol_P = np.asarray(snap["chol_P"], dtype=float)
-        self.P = np.asarray(snap["P"], dtype=float)
+        self._P = np.asarray(snap["P"], dtype=float)
         self.chol_Q = np.asarray(snap["chol_Q"], dtype=float)
-        self.Q = np.asarray(snap["Q"], dtype=float)
+        self._Q = np.asarray(snap["Q"], dtype=float)
         self.chol_R = np.asarray(snap["chol_R"], dtype=float)
-        self.R = np.asarray(snap["R"], dtype=float)
+        self._R = np.asarray(snap["R"], dtype=float)
         self.K = np.asarray(snap["K"], dtype=float)
         self.y = np.asarray(snap["y"], dtype=float).reshape(-1)
         self.z = np.asarray(snap["z"], dtype=float).reshape(-1)

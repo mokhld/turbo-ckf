@@ -12,7 +12,7 @@ setup:
 	bash turbo_ckf/setup_env.sh
 
 build:
-	$(PYTHON) -m maturin develop --release -m pyproject.toml
+	$(PYTHON) -m maturin develop --release
 
 test:
 	$(PYTHON) -m pytest turbo_ckf_tests
