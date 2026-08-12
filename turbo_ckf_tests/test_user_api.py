@@ -82,6 +82,16 @@ class StateCoercionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "P must be"):
             kf.P = np.eye(3)
 
+    def test_covariance_wrong_diagonal_length_raises(self):
+        kf = make_ckf()
+        with self.assertRaisesRegex(ValueError, "diagonal"):
+            kf.Q = [1e-3]
+
+    def test_covariance_non_numeric_raises_typeerror(self):
+        kf = make_ckf()
+        with self.assertRaisesRegex(TypeError, "Q must be"):
+            kf.Q = {"not": "a matrix"}
+
     def test_covariance_non_finite_raises(self):
         kf = make_ckf()
         with self.assertRaisesRegex(ValueError, "finite"):

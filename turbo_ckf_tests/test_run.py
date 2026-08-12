@@ -121,6 +121,27 @@ class MissingMeasurementTests(unittest.TestCase):
 
 
 class RunOptionsTests(unittest.TestCase):
+    def test_scalar_dts(self):
+        zs = make_zs(4)
+        kf_a = make_ckf()
+        kf_b = make_ckf()
+        result = kf_a.run(zs, dts=0.2)
+        for z in zs:
+            kf_b.predict(dt=0.2)
+            kf_b.update(z)
+        np.testing.assert_allclose(result.xs[-1], kf_b.x)
+
+    def test_list_Rs_per_step(self):
+        zs = make_zs(3)
+        rs = [0.1, 0.2 * np.eye(1), np.array([0.3])]
+        kf_a = make_ckf()
+        kf_b = make_ckf()
+        result = kf_a.run(zs, Rs=rs)
+        for z, r in zip(zs, [0.1 * np.eye(1), 0.2 * np.eye(1), 0.3 * np.eye(1)]):
+            kf_b.predict()
+            kf_b.update(z, R=r)
+        np.testing.assert_allclose(result.xs[-1], kf_b.x)
+
     def test_per_step_dts(self):
         zs = make_zs(4)
         dts = np.array([0.1, 0.2, 0.3, 0.4])
@@ -177,9 +198,21 @@ class RunValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dts"):
             make_ckf().run(make_zs(4), dts=np.array([0.1, 0.2]))
 
+    def test_non_finite_dts_raises(self):
+        with self.assertRaisesRegex(ValueError, "dts must contain only finite"):
+            make_ckf().run(make_zs(4), dts=np.nan)
+
     def test_bad_Rs_shape_raises(self):
         with self.assertRaisesRegex(ValueError, "Rs"):
             make_ckf().run(make_zs(4), Rs=np.zeros((2, 1, 1)))
+
+    def test_bad_Rs_list_length_raises(self):
+        with self.assertRaisesRegex(ValueError, "one entry per measurement"):
+            make_ckf().run(make_zs(4), Rs=[0.1, 0.2])
+
+    def test_bad_ndarray_zs_shape_raises(self):
+        with self.assertRaisesRegex(ValueError, "zs must have shape"):
+            make_ckf().run(np.zeros((3, 2)))  # dim_z is 1
 
 
 if __name__ == "__main__":
