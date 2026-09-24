@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `layout` argument on `TurboCKF.predict_standard_model` and
+  `predict_standard_model_ckf`: `"blocked"` (default, `[x, y, vx, vy]`) or
+  `"interleaved"` (FilterPy order, `[x, vx, y, vy]` / `[x, vx, ax, y, vy, ay]`).
+  Unknown values raise `ValueError` listing the valid choices. Previously an
+  interleaved state silently got wrong predictions (x picked up y).
+- CI runs the test suite on macOS and Windows (Python 3.12).
+
 ### Fixed
 - `rts_smooth` applied the wrong transition for time-varying models. With
   length-N `Fs`/`Qs` it used `Fs[k]`/`Qs[k]` for the k -> k+1 step, one step
@@ -20,8 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`z[3:6]`) vectors to unit length before the update. Raw sensor units
   (m/s^2, uT) previously produced attitude errors above 120 degrees with no
   error or warning; they now give the same posterior as normalized input.
+- README paper citation: the authors are Yamagishi and Jing, and the title and
+  IEEE Access reference are now correct.
+- `CONTRIBUTING.md` rebuild command (the `-m pyproject.toml` form fails on
+  current maturin) and the `setup_env.sh` test hint, which ran `unittest` and
+  skipped the pytest-style tests.
+- The `pyproject.toml` coverage comment no longer claims a cargo test job.
 
 ### Changed
+- README lists the exact wheel platforms (manylinux x86_64, macOS arm64,
+  Windows x64) and notes that other platforms build from the sdist with a Rust
+  toolchain.
 - `rts_smooth` with length-N time-varying `Fs`/`Qs` returns different
   (correct) results. Pass the same arrays you give `batch_filter`, or the
   length N-1 form.

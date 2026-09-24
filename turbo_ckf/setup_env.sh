@@ -34,5 +34,5 @@ Load rust toolchain in shell:
   source "$CARGO_HOME_DIR/env"
 
 Run tests:
-  PYTHONPATH="$ROOT_DIR" "$VENV_DIR/bin/python" -m unittest discover -s "$ROOT_DIR/turbo_ckf_tests" -p 'test_*.py'
+  PYTHONPATH="$ROOT_DIR" "$VENV_DIR/bin/python" -m pytest "$ROOT_DIR/turbo_ckf_tests"
 EOF

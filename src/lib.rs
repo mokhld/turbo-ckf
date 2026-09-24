@@ -145,9 +145,9 @@ impl CubatureKalmanFilter {
         Ok(())
     }
 
-    #[pyo3(signature = (model_type))]
-    fn predict_standard_model(&mut self, model_type: &str) -> PyResult<()> {
-        let f = transition_matrix(model_type, self.dim_x, self.dt)?;
+    #[pyo3(signature = (model_type, layout="blocked"))]
+    fn predict_standard_model(&mut self, model_type: &str, layout: &str) -> PyResult<()> {
+        let f = transition_matrix(model_type, layout, self.dim_x, self.dt)?;
         self.predict_kckf_linear(&f);
         Ok(())
     }
@@ -160,9 +160,16 @@ impl CubatureKalmanFilter {
         vec!["constant_velocity", "constant_acceleration"]
     }
 
-    #[pyo3(signature = (model_type))]
-    fn predict_standard_model_ckf(&mut self, model_type: &str) -> PyResult<()> {
-        let f = transition_matrix(model_type, self.dim_x, self.dt)?;
+    /// State layouts accepted by predict_standard_model[_ckf], for the same
+    /// friendly Python-side validation as supported_standard_models.
+    #[staticmethod]
+    fn supported_standard_layouts() -> Vec<&'static str> {
+        vec!["blocked", "interleaved"]
+    }
+
+    #[pyo3(signature = (model_type, layout="blocked"))]
+    fn predict_standard_model_ckf(&mut self, model_type: &str, layout: &str) -> PyResult<()> {
+        let f = transition_matrix(model_type, layout, self.dim_x, self.dt)?;
         self.predict_ckf_linear(&f)?;
         Ok(())
     }
@@ -484,40 +491,66 @@ fn call_model_vectorized(
     Ok(out)
 }
 
-fn transition_matrix(model_type: &str, dim_x: usize, dt: f64) -> PyResult<DMatrix<f64>> {
-    match model_type {
-        "constant_velocity" => {
-            if !dim_x.is_multiple_of(2) {
-                return Err(PyValueError::new_err(
-                    "constant_velocity requires even dim_x with [pos..., vel...] layout",
-                ));
-            }
-            let n = dim_x / 2;
-            let mut f = DMatrix::<f64>::identity(dim_x, dim_x);
-            for i in 0..n {
-                f[(i, n + i)] = dt;
-            }
-            Ok(f)
+/// Transition matrix for the built-in kinematic models.
+///
+/// `layout` says where each axis's derivatives sit in the state vector:
+/// "blocked" is `[pos..., vel...(, acc...)]`, "interleaved" is FilterPy's
+/// per-axis `[pos, vel(, acc), pos, vel(, acc), ...]`, e.g. `[x, vx, y, vy]`.
+fn transition_matrix(
+    model_type: &str,
+    layout: &str,
+    dim_x: usize,
+    dt: f64,
+) -> PyResult<DMatrix<f64>> {
+    let order = match model_type {
+        "constant_velocity" => 2,
+        "constant_acceleration" => 3,
+        _ => {
+            return Err(PyValueError::new_err(format!(
+                "unsupported model_type: {model_type}"
+            )))
         }
-        "constant_acceleration" => {
-            if !dim_x.is_multiple_of(3) {
-                return Err(PyValueError::new_err(
-                    "constant_acceleration requires dim_x multiple of 3 with [pos..., vel..., acc...] layout",
-                ));
-            }
-            let n = dim_x / 3;
-            let mut f = DMatrix::<f64>::identity(dim_x, dim_x);
-            for i in 0..n {
-                f[(i, n + i)] = dt;
-                f[(i, 2 * n + i)] = 0.5 * dt * dt;
-                f[(n + i, 2 * n + i)] = dt;
-            }
-            Ok(f)
+    };
+    let interleaved = match layout {
+        "blocked" => false,
+        "interleaved" => true,
+        _ => {
+            return Err(PyValueError::new_err(format!(
+                "unsupported layout: {layout}; expected 'blocked' or 'interleaved'"
+            )))
         }
-        _ => Err(PyValueError::new_err(format!(
-            "unsupported model_type: {model_type}"
-        ))),
+    };
+    if !dim_x.is_multiple_of(order) {
+        let pattern = match (order, interleaved) {
+            (2, false) => "[pos..., vel...]",
+            (2, true) => "[pos, vel, pos, vel, ...]",
+            (_, false) => "[pos..., vel..., acc...]",
+            (_, true) => "[pos, vel, acc, pos, vel, acc, ...]",
+        };
+        return Err(PyValueError::new_err(format!(
+            "{model_type} requires dim_x to be a multiple of {order} for the \
+             {layout} layout {pattern}; got dim_x={dim_x}"
+        )));
     }
+
+    let n = dim_x / order;
+    // State index of derivative `d` (0 pos, 1 vel, 2 acc) of axis `a`.
+    let idx = |a: usize, d: usize| {
+        if interleaved {
+            a * order + d
+        } else {
+            d * n + a
+        }
+    };
+    let mut f = DMatrix::<f64>::identity(dim_x, dim_x);
+    for a in 0..n {
+        f[(idx(a, 0), idx(a, 1))] = dt;
+        if order == 3 {
+            f[(idx(a, 0), idx(a, 2))] = 0.5 * dt * dt;
+            f[(idx(a, 1), idx(a, 2))] = dt;
+        }
+    }
+    Ok(f)
 }
 
 #[inline]

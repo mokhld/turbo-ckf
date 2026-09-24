@@ -68,3 +68,50 @@ jobs:
           . .venv/bin/activate
           PYTHONPATH=. python -m pytest turbo_ckf_tests \
             --cov=turbo_ckf --cov-report=term-missing --cov-fail-under=95
+
+  # Wheels also ship for macOS arm64 and Windows x64, so run the suite there on
+  # one Python version. The coverage gate lives in the Ubuntu job above.
+  test-macos-windows:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            venv-bin: .venv/bin
+          - os: windows-latest
+            venv-bin: .venv/Scripts
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          . ${{ matrix.venv-bin }}/activate
+          python -m pip install --upgrade pip
+          python -m pip install -r turbo_ckf/requirements-dev.txt
+
+      - name: Build extension in env
+        run: |
+          . ${{ matrix.venv-bin }}/activate
+          python -m maturin develop --release
+
+      - name: Run tests
+        run: |
+          . ${{ matrix.venv-bin }}/activate
+          PYTHONPATH=. python -m pytest turbo_ckf_tests
