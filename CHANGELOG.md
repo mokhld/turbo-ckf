@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `rts_smooth` applied the wrong transition for time-varying models. With
+  length-N `Fs`/`Qs` it used `Fs[k]`/`Qs[k]` for the k -> k+1 step, one step
+  off from `batch_filter` and FilterPy's `rts_smoother`. It now uses
+  `Fs[k+1]`/`Qs[k+1]` (entry 0 unused), so `batch_filter` followed by
+  `rts_smooth` with the same arrays matches FilterPy to ~1e-15 under irregular
+  dt (previously off by up to 0.93 state units in the regression test).
+  Results with constant F and Q are unchanged. Length N-1 input keeps its
+  meaning: entry k is the k -> k+1 transition.
+- `update_paper_ahrs` normalizes the accelerometer (`z[0:3]`) and magnetometer
+  (`z[3:6]`) vectors to unit length before the update. Raw sensor units
+  (m/s^2, uT) previously produced attitude errors above 120 degrees with no
+  error or warning; they now give the same posterior as normalized input.
+
+### Changed
+- `rts_smooth` with length-N time-varying `Fs`/`Qs` returns different
+  (correct) results. Pass the same arrays you give `batch_filter`, or the
+  length N-1 form.
+- `update_paper_ahrs` results change for any input that is not exactly unit
+  length, including nearly normalized readings. `sigma_acc2`/`sigma_mag2` are
+  variances of the unit-vector components, so values tuned against raw-unit
+  input need retuning. `kf.z` and `kf.y` hold the normalized measurement and
+  its innovation.
+
 ## [0.8.0] - 2026-08-12
 
 ### Added

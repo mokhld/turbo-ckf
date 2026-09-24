@@ -108,6 +108,14 @@ kf.predict_linear_model(Fk)
 kf.update_paper_ahrs(z6, sigma_acc2=1e-2, sigma_mag2=1e-2)
 ```
 
+`z6` is `[ax, ay, az, mx, my, mz]` in any units, for example raw m/s^2 and uT.
+The paper's observation model predicts unit vectors, so the update normalizes
+the accelerometer and magnetometer 3-vectors to unit length before using them
+(a zero or non-finite norm raises `ValueError`). `sigma_acc2` and `sigma_mag2`
+are therefore variances of the unit-vector components, not of the raw readings.
+The filter needs `dim_x=4` (quaternion) and `dim_z=6`, and the update overwrites
+`R` with `diag(sigma_acc2, sigma_acc2, sigma_acc2, sigma_mag2, sigma_mag2, sigma_mag2)`.
+
 ## Benchmarks
 
 ### Paper-Reported Targets (Shing et al., arXiv:2602.12283)

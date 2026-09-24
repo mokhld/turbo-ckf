@@ -280,8 +280,21 @@ impl CubatureKalmanFilter {
                 "sigma_mag2 must be finite and positive",
             ));
         }
-        let z_vec = pyarray1_to_dvector(z, self.dim_z, "z")?;
+        let mut z_vec = pyarray1_to_dvector(z, self.dim_z, "z")?;
         require_finite_measurement(&z_vec)?;
+        // The observation model predicts unit vectors, so the accelerometer
+        // (z[0..3]) and magnetometer (z[3..6]) readings are scaled to unit
+        // length first. Raw sensor units would otherwise dominate the
+        // innovation. The normalized z is what gets recorded below.
+        for start in [0, 3] {
+            let norm = z_vec.rows(start, 3).norm();
+            if !norm.is_finite() || norm <= 0.0 {
+                return Err(PyValueError::new_err(
+                    "acceleration and magnetic measurements must have positive finite norms",
+                ));
+            }
+            z_vec.rows_mut(start, 3).unscale_mut(norm);
+        }
         let (m_n, m_d) = magnetic_reference_terms(&z_vec)?;
 
         let (sigma, jitter) = cubature_points(&self.x, &self.p)?;
@@ -715,12 +728,14 @@ fn dmatrix_to_pyarray<'py>(py: Python<'py>, mat: &DMatrix<f64>) -> PyResult<&'py
 /// Inputs are the forward-filtered trace:
 ///   xs: (N, dim_x)              -- filtered state means x_{k|k}
 ///   ps: (N, dim_x, dim_x)       -- filtered covariances P_{k|k}
-///   fs: (N or N-1, dim_x, dim_x) -- per-step transition F_k (maps k -> k+1)
-///   qs: (N or N-1, dim_x, dim_x) -- per-step process-noise Q_k
+///   fs: (N or N-1, dim_x, dim_x) -- per-step transition matrices
+///   qs: (N or N-1, dim_x, dim_x) -- per-step process-noise covariances
 ///
-/// When fs/qs are passed with length N (FilterPy convention) the last entry
-/// is unused. Per-step matrices let the smoother handle non-constant
-/// transitions without callbacks.
+/// With length N (FilterPy and batch_filter_linear convention), entry k is
+/// the k-1 -> k transition: the k -> k+1 step uses fs[k+1] / qs[k+1] and
+/// entry 0 is unused. With length N-1, entry k is the k -> k+1 transition.
+/// fs and qs are each read by their own length. Per-step matrices let the
+/// smoother handle non-constant transitions without callbacks.
 ///
 /// Returns (xs_smooth, Ps_smooth) of the same shapes as (xs, ps). The inverse
 /// of the one-step-predicted covariance uses the same Cholesky-with-fallback
@@ -781,10 +796,14 @@ fn rts_smooth<'py>(
     let xs_filt: Vec<DVector<f64>> = xs_smooth.clone();
     let ps_filt: Vec<DMatrix<f64>> = ps_smooth.clone();
 
+    // Index offset of the k -> k+1 transition: 1 for length-N input, 0 for N-1.
+    let f_off = usize::from(fs_arr.shape()[0] == n);
+    let q_off = usize::from(qs_arr.shape()[0] == n);
+
     if n >= 2 {
         for k in (0..n - 1).rev() {
-            let f_k = DMatrix::from_fn(dim_x, dim_x, |r, c| fs_arr[[k, r, c]]);
-            let q_k = DMatrix::from_fn(dim_x, dim_x, |r, c| qs_arr[[k, r, c]]);
+            let f_k = DMatrix::from_fn(dim_x, dim_x, |r, c| fs_arr[[k + f_off, r, c]]);
+            let q_k = DMatrix::from_fn(dim_x, dim_x, |r, c| qs_arr[[k + q_off, r, c]]);
 
             let x_filt_k = &xs_filt[k];
             let p_filt_k = &ps_filt[k];

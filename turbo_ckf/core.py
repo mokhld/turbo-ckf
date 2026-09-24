@@ -645,7 +645,21 @@ class TurboCKF(_ValidatedStateMixin):
     def update_paper_ahrs(
         self, z: npt.ArrayLike, sigma_acc2: float, sigma_mag2: float
     ) -> Vector:
-        """Run Eq. (9), (12)-(14) AHRS update in Rust."""
+        """Run Eq. (9), (12)-(14) AHRS update in Rust.
+
+        Args:
+            z: ``[ax, ay, az, mx, my, mz]``, accelerometer then magnetometer,
+                in any units (for example m/s^2 and uT). Each 3-vector is
+                normalized to unit length before the update, because the
+                observation model predicts unit vectors. The recorded
+                ``self.z`` and ``self.y`` use the normalized values. A zero or
+                non-finite norm raises ``ValueError``.
+            sigma_acc2: variance of each unit-vector accelerometer component.
+            sigma_mag2: variance of each unit-vector magnetometer component.
+
+        ``R`` is overwritten with a diagonal matrix holding ``sigma_acc2`` in
+        the first three entries and ``sigma_mag2`` in the last three.
+        """
 
         if self.dim_x != 4 or self.dim_z != 6:
             raise ValueError("update_paper_ahrs requires dim_x == 4 and dim_z == 6")
@@ -978,9 +992,13 @@ class TurboCKF(_ValidatedStateMixin):
         this is the order-of-magnitude path the audit called out.
 
         ``F``, ``H``, ``Q``, ``R`` may be either constant matrices or
-        per-step arrays with leading dimension ``N``. Per-step inputs
-        match the contract that ``rts_smooth`` consumes, so a
-        forward-then-backward pass is one composed call away.
+        per-step arrays with leading dimension ``N``. Each step predicts
+        then updates, so ``F[k]`` and ``Q[k]`` are the step ``k-1 -> k``
+        transition (``F[0]`` maps ``x0`` to step 0). This is the FilterPy
+        convention, and ``rts_smooth`` accepts the same length-``N`` arrays::
+
+            xs, Ps, _ = TurboCKF.batch_filter(x0, P0, zs, Fs, H, Qs, R)
+            xs_s, Ps_s = TurboCKF.rts_smooth(xs, Ps, Fs, Qs)
 
         For nonlinear ``fx`` / ``hx``, use the per-step ``predict()`` /
         ``update()`` API on a :class:`TurboCKF` instance.
@@ -1180,11 +1198,20 @@ class TurboCKF(_ValidatedStateMixin):
         Args:
             xs: filtered state means, shape ``(N, dim_x)``.
             Ps: filtered covariances, shape ``(N, dim_x, dim_x)``.
-            Fs: per-step transition matrices ``F_k`` that map step ``k`` to
-                ``k+1``. Shape ``(N, dim_x, dim_x)`` (FilterPy-compatible —
-                last entry unused) or ``(N-1, dim_x, dim_x)``.
-            Qs: per-step process-noise covariances ``Q_k``. Same shape rules
-                as ``Fs``.
+            Fs: per-step transition matrices, in one of two layouts:
+
+                - ``(N, dim_x, dim_x)``: ``Fs[k]`` maps step ``k-1`` to ``k``,
+                  so the ``k -> k+1`` step uses ``Fs[k+1]`` and ``Fs[0]`` is
+                  unused. This is the layout ``batch_filter`` consumes and
+                  FilterPy's ``rts_smoother`` expects, so the same array can
+                  be passed to both.
+                - ``(N-1, dim_x, dim_x)``: ``Fs[k]`` maps step ``k`` to
+                  ``k+1``. A length-``N`` array ``Fs`` is equivalent to
+                  ``Fs[1:]`` here.
+            Qs: per-step process-noise covariances. Same layouts as ``Fs``,
+                with ``Qs[k]`` added in the step that ``Fs[k]`` describes.
+                The layout of ``Qs`` is taken from its own length, not from
+                ``Fs``.
 
         Returns:
             ``(xs_smooth, Ps_smooth)`` with the same shapes as ``(xs, Ps)``.

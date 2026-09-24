@@ -5,7 +5,8 @@ trajectory. We simulate a noisy constant-velocity (CV) walk, run the
 forward filter to collect (xs, Ps, Fs, Qs), then smooth backwards. RMSE
 of the smoothed position must drop by at least 30% versus the filtered
 position. Also covers single-step traces (identity), shape validation,
-and the FilterPy-compatible length-N vs length-(N-1) input convention.
+the FilterPy-compatible length-N vs length-(N-1) input convention, and
+parity with FilterPy's batch_filter + rts_smoother for time-varying F/Q.
 """
 
 from __future__ import annotations
@@ -15,6 +16,11 @@ import unittest
 import numpy as np
 
 from turbo_ckf import TurboCKF, rts_smooth
+
+try:
+    from filterpy.kalman import KalmanFilter as FilterPyKF
+except Exception:  # pragma: no cover - optional dependency
+    FilterPyKF = None
 
 
 def _cv_matrices(dt: float, q_var: float) -> tuple[np.ndarray, np.ndarray]:
@@ -115,11 +121,12 @@ class RtsSmootherTests(unittest.TestCase):
         self.assertTrue(np.allclose(Ps_s, Ps))
 
     def test_length_n_and_length_n_minus_one_agree(self):
-        """FilterPy-compat: passing Fs/Qs at length N (last unused) must match
-        passing them at length N-1."""
+        """FilterPy-compat: passing Fs/Qs at length N (entry k is the k-1 -> k
+        transition, first entry unused) must match passing Fs[1:]/Qs[1:] at
+        length N-1 (entry k is the k -> k+1 transition)."""
         _, xs, Ps, Fs_n, Qs_n = _simulate_and_filter(seed=2, n_steps=20, dt=0.1)
         xs_a, Ps_a = rts_smooth(xs, Ps, Fs_n, Qs_n)
-        xs_b, Ps_b = rts_smooth(xs, Ps, Fs_n[:-1], Qs_n[:-1])
+        xs_b, Ps_b = rts_smooth(xs, Ps, Fs_n[1:], Qs_n[1:])
         self.assertTrue(np.allclose(xs_a, xs_b))
         self.assertTrue(np.allclose(Ps_a, Ps_b))
 
@@ -159,6 +166,66 @@ class RtsSmootherTests(unittest.TestCase):
         xs_a, _ = rts_smooth(xs, Ps, Fs, Qs)
         xs_b, _ = TurboCKF.rts_smooth(xs, Ps, Fs, Qs)
         self.assertTrue(np.allclose(xs_a, xs_b))
+
+
+def _irregular_dt_problem(seed: int, n_steps: int):
+    """CV model sampled at irregular dt, so F and Q differ at every step.
+
+    Entry k of Fs/Qs is the (k-1) -> k transition, the layout batch_filter
+    consumes. Constant F/Q cannot tell Fs[k] from Fs[k+1], which is why the
+    constant-matrix tests above never caught an indexing error.
+    """
+    rng = np.random.default_rng(seed)
+    dts = rng.uniform(0.05, 1.0, n_steps)
+    Fs = np.array([[[1.0, d], [0.0, 1.0]] for d in dts])
+    Qs = np.array([0.3 * np.array([[d**3 / 3, d**2 / 2], [d**2 / 2, d]]) for d in dts])
+    zs = rng.normal(size=(n_steps, 1)).cumsum(axis=0)
+    return Fs, Qs, zs
+
+
+class TimeVaryingRtsTests(unittest.TestCase):
+    """batch_filter -> rts_smooth with per-step F/Q must match FilterPy."""
+
+    X0 = np.zeros(2)
+    P0 = 10.0 * np.eye(2)
+    H = np.array([[1.0, 0.0]])
+    R = 0.5 * np.eye(1)
+
+    def _forward(self, Fs, Qs, zs):
+        xs, Ps, _ = TurboCKF.batch_filter(self.X0, self.P0, zs, Fs, self.H, Qs, self.R)
+        return xs, Ps
+
+    @unittest.skipIf(FilterPyKF is None, "filterpy not installed")
+    def test_batch_filter_then_rts_smooth_matches_filterpy(self):
+        Fs, Qs, zs = _irregular_dt_problem(seed=0, n_steps=60)
+        xs, Ps = self._forward(Fs, Qs, zs)
+        xs_s, Ps_s = rts_smooth(xs, Ps, Fs, Qs)
+
+        fp = FilterPyKF(dim_x=2, dim_z=1)
+        fp.x = self.X0.copy()
+        fp.P = self.P0.copy()
+        fp.H = self.H.copy()
+        fp.R = self.R.copy()
+        fp_xs, fp_Ps, _, _ = fp.batch_filter(zs, Fs=Fs, Qs=Qs)
+        fp_xs_s, fp_Ps_s, _, _ = fp.rts_smoother(fp_xs, fp_Ps, Fs=Fs, Qs=Qs)
+
+        # The forward passes agree, so any gap below belongs to the smoother.
+        np.testing.assert_allclose(xs, fp_xs, rtol=0, atol=1e-10)
+        np.testing.assert_allclose(Ps, fp_Ps, rtol=0, atol=1e-10)
+        np.testing.assert_allclose(xs_s, fp_xs_s, rtol=0, atol=1e-10)
+        np.testing.assert_allclose(Ps_s, fp_Ps_s, rtol=0, atol=1e-10)
+
+    def test_length_n_minus_one_form_matches_length_n_for_time_varying_f_q(self):
+        Fs, Qs, zs = _irregular_dt_problem(seed=1, n_steps=60)
+        xs, Ps = self._forward(Fs, Qs, zs)
+        xs_n, Ps_n = rts_smooth(xs, Ps, Fs, Qs)
+        xs_m, Ps_m = rts_smooth(xs, Ps, Fs[1:], Qs[1:])
+        np.testing.assert_allclose(xs_n, xs_m, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(Ps_n, Ps_m, rtol=0, atol=1e-12)
+        # Fs and Qs lengths are interpreted independently of each other.
+        xs_mix, Ps_mix = rts_smooth(xs, Ps, Fs, Qs[1:])
+        np.testing.assert_allclose(xs_mix, xs_n, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(Ps_mix, Ps_n, rtol=0, atol=1e-12)
 
 
 if __name__ == "__main__":
