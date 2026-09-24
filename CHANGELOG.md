@@ -14,8 +14,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Unknown values raise `ValueError` listing the valid choices. Previously an
   interleaved state silently got wrong predictions (x picked up y).
 - CI runs the test suite on macOS and Windows (Python 3.12).
+- `batch_parallel_step` status code `3`: the filter's own `x_i`, `P_i` or `z_i`
+  held NaN or inf and its update was skipped. A bad `z_i` returns the
+  predict-step output with log-likelihood -inf; a bad `x_i`/`P_i` returns the
+  inputs unchanged with log-likelihood NaN. The rest of the bank still updates.
 
 ### Fixed
+- `batch_filter` returned NaN for every step after a NaN/inf observation
+  without raising. It now raises `ValueError` naming the first bad row
+  (`zs[k]`) and pointing to `run(..., nan_means_missing=True)`. Non-finite
+  `x0`, `P0`, `F`, `H`, `Q`, `R` also raise, naming the array and step.
+- `batch_parallel_step` reported status 0 next to a NaN state for a filter with
+  a NaN observation. Non-finite shared `F`/`H`/`Q`/`R` now raise `ValueError`.
+- An `fx` or `hx` returning NaN/inf silently corrupted `x` and `P`, and the
+  next call failed with "unable to compute stable Cholesky factor". Both
+  filters now raise `ValueError` naming the callback and the sigma-point row,
+  with `x` and `P` unchanged.
+- The Cholesky jitter fallback added a fixed 1e-12 up to 1e-6 to the diagonal.
+  That rounded away to nothing for variances above about 1.7e10, so singular
+  covariances at that scale raised, and it swamped variances below 1e-12 (NIS
+  0.083 instead of 0.25 in a two-clock example expressed in seconds). The
+  jitter is now relative to each diagonal entry, so results no longer depend
+  on the units of the state. Results are unchanged whenever no jitter is
+  needed; `last_jitter`/`max_jitter` still report the absolute amount added.
 - `rts_smooth` applied the wrong transition for time-varying models. With
   length-N `Fs`/`Qs` it used `Fs[k]`/`Qs[k]` for the k -> k+1 step, one step
   off from `batch_filter` and FilterPy's `rts_smoother`. It now uses

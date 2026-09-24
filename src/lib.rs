@@ -488,6 +488,16 @@ fn call_model_vectorized(
     let out_arr: PyReadonlyArray2<f64> = out_obj.extract(py)?;
 
     let out = pyarray2_to_dmatrix(out_arr, sigma.nrows(), expected_dim, "model output")?;
+    // A NaN/inf here would be averaged into x and P and only surface on the
+    // next call as a Cholesky failure. Callers assign x and P after this
+    // returns, so raising here leaves them unchanged.
+    if let Some(row) = (0..out.nrows()).find(|&i| out.row(i).iter().any(|v| !v.is_finite())) {
+        let name = if dt.is_some() { "fx" } else { "hx" };
+        return Err(PyValueError::new_err(format!(
+            "{name} returned non-finite values (NaN or inf) in output row {row} \
+             (sigma point {row}); x and P were left unchanged"
+        )));
+    }
     Ok(out)
 }
 
@@ -576,17 +586,31 @@ fn cubature_points(x: &DVector<f64>, p: &DMatrix<f64>) -> PyResult<(DMatrix<f64>
 /// Returns the Cholesky factor of `p` plus any jitter that had to be added to
 /// the diagonal to make the decomposition succeed. Callers should record the
 /// jitter so the user can see when P is silently being conditioned.
+///
+/// The jitter is relative to each diagonal entry (1e-12 up to 1e-6 of it), so
+/// the rescue does not depend on the units a state is expressed in. A fixed
+/// absolute ladder rounds away to nothing once a diagonal entry passes about
+/// 1.7e10 (1e-6 is under half an ulp there), and it swamps variances much
+/// smaller than 1e-12. Entries that are zero, negative or non-finite use a
+/// scale of 1.0, so Q = 0 still factors. The returned jitter is the largest
+/// amount added to any diagonal entry.
 fn stable_cholesky(p: &DMatrix<f64>) -> PyResult<(DMatrix<f64>, f64)> {
-    let n = p.nrows();
-    let eye = DMatrix::<f64>::identity(n, n);
-    let mut jitter = 0.0_f64;
-
-    for _ in 0..8 {
-        let candidate = p + eye.scale(jitter);
-        if let Some(chol) = candidate.cholesky() {
-            return Ok((chol.l(), jitter));
+    if let Some(chol) = p.clone().cholesky() {
+        return Ok((chol.l(), 0.0));
+    }
+    let scale = p
+        .diagonal()
+        .map(|d| if d.is_finite() && d > 0.0 { d } else { 1.0 });
+    let mut rel = 1e-12;
+    for _ in 0..7 {
+        let mut candidate = p.clone();
+        for (i, s) in scale.iter().enumerate() {
+            candidate[(i, i)] += rel * s;
         }
-        jitter = if jitter == 0.0 { 1e-12 } else { jitter * 10.0 };
+        if let Some(chol) = candidate.cholesky() {
+            return Ok((chol.l(), rel * scale.max()));
+        }
+        rel *= 10.0;
     }
     Err(PyRuntimeError::new_err(
         "unable to compute stable Cholesky factor",
@@ -947,6 +971,38 @@ fn batch_filter_linear<'py>(
     check_3d("Qs", qs_arr.shape(), n, dim_x, dim_x)?;
     check_3d("Rs", rs_arr.shape(), n, dim_z, dim_z)?;
 
+    // Reject NaN/inf before the loop: one bad value would otherwise turn every
+    // later row of the output into NaN without raising.
+    if !x0_arr.iter().all(|v| v.is_finite()) {
+        return Err(PyValueError::new_err(
+            "x0 contains non-finite values (NaN or inf)",
+        ));
+    }
+    if !p0_arr.iter().all(|v| v.is_finite()) {
+        return Err(PyValueError::new_err(
+            "P0 contains non-finite values (NaN or inf)",
+        ));
+    }
+    if let Some(k) = first_non_finite_step(&zs_arr) {
+        return Err(PyValueError::new_err(format!(
+            "zs[{k}] contains non-finite values (NaN or inf). batch_filter does not \
+             support missing measurements yet; use TurboCKF.run(..., \
+             nan_means_missing=True), which skips all-NaN rows"
+        )));
+    }
+    for (name, arr) in [
+        ("F", &fs_arr),
+        ("H", &hs_arr),
+        ("Q", &qs_arr),
+        ("R", &rs_arr),
+    ] {
+        if let Some(k) = first_non_finite_step(arr) {
+            return Err(PyValueError::new_err(format!(
+                "{name} contains non-finite values (NaN or inf) at step {k}"
+            )));
+        }
+    }
+
     let mut x = DVector::from_iterator(dim_x, (0..dim_x).map(|j| x0_arr[j]));
     let mut p = DMatrix::from_fn(dim_x, dim_x, |r, c| p0_arr[[r, c]]);
 
@@ -1027,6 +1083,19 @@ fn batch_filter_linear<'py>(
     ))
 }
 
+/// Index along the leading axis of the first sub-array that holds a NaN or
+/// inf, or None when every value is finite.
+fn first_non_finite_step<D: numpy::ndarray::RemoveAxis>(
+    arr: &numpy::ndarray::ArrayView<f64, D>,
+) -> Option<usize> {
+    // Whole-array scan first; the per-step search only runs on failure.
+    if arr.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    arr.outer_iter()
+        .position(|step| step.iter().any(|v| !v.is_finite()))
+}
+
 // ----------------------------------------------------------------------------
 // Parallel batch step: many filters, one observation each
 // ----------------------------------------------------------------------------
@@ -1046,6 +1115,12 @@ fn batch_filter_linear<'py>(
 //   1 = singular_innovation, fell back to pseudo-inverse for S
 //   2 = failed, no inverse at all — state stays at the predict-step output
 //       (no measurement update applied) and ll = -inf
+//   3 = non-finite per-filter input (NaN or inf), update skipped. A bad z_i
+//       with finite x_i/P_i returns the predict-step output and ll = -inf
+//       (as for 2); a bad x_i or P_i returns that filter's inputs unchanged
+//       and ll = NaN.
+// Non-finite shared F/H/Q/R raise ValueError for the whole call, since every
+// filter would be affected. One bad filter does not abort the bank.
 //
 // The linear path never touches `stable_cholesky` on P, so the jitter
 // surface that the per-step path exposes via snapshot() does not apply.
@@ -1101,10 +1176,20 @@ fn linear_predict_update_step(
     log_two_pi: f64,
     dim_z: usize,
 ) -> (DVector<f64>, DMatrix<f64>, f64, i64) {
+    // Status 3: a NaN/inf in this filter's own inputs would otherwise come
+    // back as a NaN state next to status 0.
+    if !(x_in.iter().all(|v| v.is_finite()) && p_in.iter().all(|v| v.is_finite())) {
+        return (x_in.clone(), p_in.clone(), f64::NAN, 3);
+    }
+
     // Predict
     let x_pred = f * x_in;
     let mut p_pred = f * p_in * f_t + q;
     symmetrize_in_place(&mut p_pred);
+
+    if !z.iter().all(|v| v.is_finite()) {
+        return (x_pred, p_pred, f64::NEG_INFINITY, 3);
+    }
 
     // Innovation
     let z_pred = h * &x_pred;
@@ -1151,7 +1236,9 @@ fn linear_predict_update_step(
 ///
 /// Returns (xs_new, ps_new, log_likelihoods, status) with shapes
 /// (M, dim_x), (M, dim_x, dim_x), (M,), (M,). Status code per filter:
-///   0 = ok, 1 = singular_innovation fallback, 2 = no update applied.
+///   0 = ok, 1 = singular_innovation fallback, 2 = no update applied,
+///   3 = non-finite x_i, P_i or z_i, update skipped.
+/// Raises ValueError when the shared F, H, Q or R holds a NaN or inf.
 #[pyfunction]
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn batch_parallel_step<'py>(
@@ -1222,6 +1309,14 @@ fn batch_parallel_step<'py>(
     check_2d("H", h_arr.shape(), dim_z, dim_x)?;
     check_2d("Q", q_arr.shape(), dim_x, dim_x)?;
     check_2d("R", r_arr.shape(), dim_z, dim_z)?;
+    for (name, arr) in [("F", &f_arr), ("H", &h_arr), ("Q", &q_arr), ("R", &r_arr)] {
+        if !arr.iter().all(|v| v.is_finite()) {
+            return Err(PyValueError::new_err(format!(
+                "{name} contains non-finite values (NaN or inf); it is shared by \
+                 every filter in the bank"
+            )));
+        }
+    }
 
     // Copy inputs out of Python-owned storage so we can drop the GIL.
     let f_mat = DMatrix::from_fn(dim_x, dim_x, |r, c| f_arr[[r, c]]);

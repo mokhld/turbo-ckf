@@ -101,7 +101,12 @@ predict, including the standard/linear-model paths.
 
 A NaN or inf measurement raises instead of corrupting the state. For a missed
 measurement pass `z=None`, which runs the predict-only step and clears the
-innovation diagnostics.
+innovation diagnostics. The same applies to `batch_filter`, which does not skip
+missing measurements yet (use `run(..., nan_means_missing=True)` for sequences
+with dropouts), and to callback outputs: an `fx` or `hx` that returns NaN or
+inf raises a `ValueError` naming it, and the state is left unchanged. In
+`batch_parallel_step`, a filter whose own `x`, `P` or `z` is non-finite gets
+status 3 and is skipped while the rest of the bank updates.
 
 ### Filtering a whole sequence
 
