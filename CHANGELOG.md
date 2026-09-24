@@ -7,105 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-24
+
+This release fixes eight correctness bugs from a full review of the package and
+moves filter state into Rust, which makes a predict+update step about 3x faster.
+Several fixes change numerical results; read "Changed" before upgrading.
+
 ### Added
 - `layout` argument on `TurboCKF.predict_standard_model` and
   `predict_standard_model_ckf`: `"blocked"` (default, `[x, y, vx, vy]`) or
   `"interleaved"` (FilterPy order, `[x, vx, y, vy]` / `[x, vx, ax, y, vy, ay]`).
-  Unknown values raise `ValueError` listing the valid choices. Previously an
-  interleaved state silently got wrong predictions (x picked up y).
-- CI runs the test suite on macOS and Windows (Python 3.12).
+  Unknown values raise `ValueError` listing the valid choices.
+- `TurboSRCKF.copy()`, `to_dict()`, `from_dict()` and `__deepcopy__`.
+- Pickle support for `TurboCKF` and `TurboSRCKF`, built on `to_dict()`; `fx`/`hx`
+  are pickled by reference, so module-level functions work.
 - `batch_parallel_step` status code `3`: the filter's own `x_i`, `P_i` or `z_i`
   held NaN or inf and its update was skipped. A bad `z_i` returns the
   predict-step output with log-likelihood -inf; a bad `x_i`/`P_i` returns the
   inputs unchanged with log-likelihood NaN. The rest of the bank still updates.
-- `TurboSRCKF.copy()`, `to_dict()`, `from_dict()` and `__deepcopy__`.
-- Pickle support for `TurboCKF` and `TurboSRCKF`, built on `to_dict()`; `fx`/`hx`
-  are pickled by reference, so module-level functions work.
-
-### Fixed
-- `TurboSRCKF` re-factored P on every call, because the wrapper pushed
-  `chol_P chol_P^T` back to Rust before each step, and it did not count the
-  jitter that added (jitter on 5000 of 5000 steps in the ill-conditioned test,
-  with `jitter_count` 0). `chol_P` now stays in Rust across steps.
-- `copy()` and `from_dict()` lost the diagnostic counters after one step, and
-  neither filter could be pickled.
-- `batch_filter` returned NaN for every step after a NaN/inf observation
-  without raising. It now raises `ValueError` naming the first bad row
-  (`zs[k]`) and pointing to `run(..., nan_means_missing=True)`. Non-finite
-  `x0`, `P0`, `F`, `H`, `Q`, `R` also raise, naming the array and step.
-- `batch_parallel_step` reported status 0 next to a NaN state for a filter with
-  a NaN observation. Non-finite shared `F`/`H`/`Q`/`R` now raise `ValueError`.
-- An `fx` or `hx` returning NaN/inf silently corrupted `x` and `P`, and the
-  next call failed with "unable to compute stable Cholesky factor". Both
-  filters now raise `ValueError` naming the callback and the sigma-point row,
-  with `x` and `P` unchanged.
-- The Cholesky jitter fallback added a fixed 1e-12 up to 1e-6 to the diagonal.
-  That rounded away to nothing for variances above about 1.7e10, so singular
-  covariances at that scale raised, and it swamped variances below 1e-12 (NIS
-  0.083 instead of 0.25 in a two-clock example expressed in seconds). The
-  jitter is now relative to each diagonal entry, so results no longer depend
-  on the units of the state. Results are unchanged whenever no jitter is
-  needed; `last_jitter`/`max_jitter` still report the absolute amount added.
-- `TurboCKF` builds its cubature covariances from deviations about the mean in
-  `predict()`, `predict_linear_model_ckf()`, `predict_standard_model_ckf()`,
-  `update()` and `update_paper_ahrs()`. The previous `E[x x^T] - mean mean^T`
-  form cancelled when the state was far from zero: a constant-velocity filter
-  at an ECEF-sized position (6.4e6 m) raised "unable to compute stable
-  Cholesky factor" after 8 steps. It now matches the same filter run at the
-  origin to float64 resolution and matches `TurboSRCKF`. States near zero
-  change only at round-off level.
-- `nis` and `mahalanobis` are NaN, not 0, when the innovation distance is NaN,
-  so a broken update no longer passes `gate()`.
-- An `fx` or `hx` callback that raises no longer changes `jitter_count`,
-  `last_jitter` or `max_jitter`.
-- `rts_smooth` applied the wrong transition for time-varying models. With
-  length-N `Fs`/`Qs` it used `Fs[k]`/`Qs[k]` for the k -> k+1 step, one step
-  off from `batch_filter` and FilterPy's `rts_smoother`. It now uses
-  `Fs[k+1]`/`Qs[k+1]` (entry 0 unused), so `batch_filter` followed by
-  `rts_smooth` with the same arrays matches FilterPy to ~1e-15 under irregular
-  dt (previously off by up to 0.93 state units in the regression test).
-  Results with constant F and Q are unchanged. Length N-1 input keeps its
-  meaning: entry k is the k -> k+1 transition.
-- `update_paper_ahrs` normalizes the accelerometer (`z[0:3]`) and magnetometer
-  (`z[3:6]`) vectors to unit length before the update. Raw sensor units
-  (m/s^2, uT) previously produced attitude errors above 120 degrees with no
-  error or warning; they now give the same posterior as normalized input.
-- README paper citation: the authors are Yamagishi and Jing, and the title and
-  IEEE Access reference are now correct.
-- `CONTRIBUTING.md` rebuild command (the `-m pyproject.toml` form fails on
-  current maturin) and the `setup_env.sh` test hint, which ran `unittest` and
-  skipped the pytest-style tests.
-- The `pyproject.toml` coverage comment no longer claims a cargo test job.
-- Adaptive noise (`enable_adaptive_noise`) no longer raises "unable to compute
-  stable Cholesky factor" when `R` or `P` starts overestimated with
-  `dim_z >= 2` (14 to 20 of 20 runs crashed in the review scenarios). Only the
-  diagonal of the written-back estimate was floored, so it could be
-  indefinite. `R`/`Q` write-backs are now projected onto symmetric matrices
-  with every eigenvalue at least `diagonal_floor`.
-- Adaptive `R` is estimated against the `R` actually applied on each update.
-  Under `update(z, R=...)` or `run(zs, Rs=...)` it used the stored `self.R`,
-  which left the estimate with no fixed point.
+- CI runs the test suite on macOS and Windows (Python 3.12) as well as Ubuntu.
 
 ### Changed
-- The adaptive `R` channel uses the residual-based estimate
-  `e e^T + H P_post H^T` (Akhlaghi et al. 2017) instead of `y y^T + R - S`.
-  Each contribution is positive semi-definite, so `R` no longer collapses to
-  the floor while `P` is overestimated. Eigenvalue projection alone stopped the
-  crash but let up to 12 of 20 runs diverge. Adaptive `R` trajectories differ
-  from 0.8.0 for the same inputs, and an adaptive update costs about 11 us more.
-- `diagonal_floor` in `enable_adaptive_noise` is an eigenvalue floor; the name
-  is unchanged.
-- README lists the exact wheel platforms (manylinux x86_64, macOS arm64,
-  Windows x64) and notes that other platforms build from the sdist with a Rust
-  toolchain.
-- `rts_smooth` with length-N time-varying `Fs`/`Qs` returns different
-  (correct) results. Pass the same arrays you give `batch_filter`, or the
-  length N-1 form.
-- `update_paper_ahrs` results change for any input that is not exactly unit
-  length, including nearly normalized readings. `sigma_acc2`/`sigma_mag2` are
-  variances of the unit-vector components, so values tuned against raw-unit
-  input need retuning. `kf.z` and `kf.y` hold the normalized measurement and
-  its innovation.
 - Filter state lives in the Rust backend. Attributes are fetched when read and
   cached until the next call, and only in-place edits are pushed back. For a
   4-state/2-measurement model: `predict_standard_model` + `update` 12.6 -> 4.1
@@ -116,15 +38,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so writing to one raises `ValueError` instead of being silently lost.
 - Assigning `x`/`P`/`Q`/`R` copies the value; later edits to the caller's own
   array no longer reach the filter.
+- `rts_smooth` with length-N time-varying `Fs`/`Qs` returns different (correct)
+  results; see Fixed. Pass the same arrays you give `batch_filter`, or the
+  length N-1 form.
+- `update_paper_ahrs` normalizes its input, so results change for any reading
+  that is not exactly unit length. `sigma_acc2`/`sigma_mag2` are variances of
+  the unit-vector components; values tuned against raw-unit input need
+  retuning. `kf.z` and `kf.y` hold the normalized measurement and its
+  innovation.
+- The adaptive `R` channel uses the residual-based estimate
+  `e e^T + H P_post H^T` (Akhlaghi et al. 2017) instead of `y y^T + R - S`, so
+  adaptive `R` trajectories differ from 0.8.0. An adaptive update costs about
+  11 us more. `diagonal_floor` is now an eigenvalue floor; the name is
+  unchanged.
+- The Cholesky jitter fallback is relative to each diagonal entry (1e-12 up to
+  1e-6 of it) instead of a fixed 1e-12 up to 1e-6. Results are unchanged
+  whenever no jitter is needed; `last_jitter`/`max_jitter` still report the
+  absolute amount added.
 - `TurboSRCKF` factors P/Q/R once when assigned (or at the next call after an
   in-place edit), and a P that cannot be factored raises at assignment. Seed
-  and per-call-R jitter now count in `jitter_count`, and `last_jitter` is the
+  and per-call-R jitter count in `jitter_count`, and `last_jitter` is the
   jitter of the most recent step. `chol_P`/`chol_Q`/`chol_R` are read-only.
 - After `update(z=None)`, `x_post`/`P_post` (equal to the prior) and `z` (NaN)
   persist until the next real update.
 - `to_dict()` includes every backend field; older dicts still load.
   `from_dict()` raises `ValueError`, not `KeyError`, when required fields are
   missing. `copy.copy(kf)` returns an independent filter.
+- README lists the exact wheel platforms (manylinux x86_64, macOS arm64,
+  Windows x64) and notes that other platforms build from the sdist with a Rust
+  toolchain.
+
+### Fixed
+- `rts_smooth` applied the wrong transition for time-varying models. With
+  length-N `Fs`/`Qs` it used `Fs[k]`/`Qs[k]` for the k -> k+1 step, one step off
+  from `batch_filter` and FilterPy's `rts_smoother`. It now uses
+  `Fs[k+1]`/`Qs[k+1]` (entry 0 unused) and matches FilterPy to ~1e-15 under
+  irregular dt (previously off by up to 0.93 state units in the regression
+  test). Results with constant F and Q are unchanged.
+- `update_paper_ahrs` used the accelerometer and magnetometer readings as
+  given, although the observation model predicts unit vectors. Raw sensor
+  units (m/s^2, uT) produced attitude errors above 120 degrees with no error or
+  warning; they now give the same posterior as normalized input.
+- `TurboCKF` computed cubature covariances as `E[x x^T] - mean mean^T`, which
+  cancelled when the state was far from zero: a constant-velocity filter at an
+  ECEF-sized position (6.4e6 m) raised "unable to compute stable Cholesky
+  factor" after 8 steps. Moments are now built from deviations about the mean
+  and match the same filter run at the origin to float64 resolution.
+- `TurboSRCKF` re-factored P on every call, because the wrapper pushed
+  `chol_P chol_P^T` back to Rust before each step, and it did not count the
+  jitter that added (jitter on 5000 of 5000 steps in the ill-conditioned test,
+  with `jitter_count` 0). `chol_P` now stays in Rust across steps.
+- Adaptive noise (`enable_adaptive_noise`) raised "unable to compute stable
+  Cholesky factor" when `R` or `P` started overestimated with `dim_z >= 2`
+  (14 to 20 of 20 runs in the review scenarios), because only the diagonal of
+  the written-back estimate was floored. Write-backs are now projected onto
+  symmetric matrices with every eigenvalue at least `diagonal_floor`.
+- Adaptive `R` is estimated against the `R` actually applied on each update.
+  Under `update(z, R=...)` or `run(zs, Rs=...)` it used the stored `self.R`,
+  which left the estimate with no fixed point.
+- `batch_filter` returned NaN for every step after a NaN/inf observation
+  without raising. It now raises `ValueError` naming the first bad row
+  (`zs[k]`) and pointing to `run(..., nan_means_missing=True)`. Non-finite
+  `x0`, `P0`, `F`, `H`, `Q`, `R` also raise, naming the array and step.
+- `batch_parallel_step` reported status 0 next to a NaN state for a filter with
+  a NaN observation. Non-finite shared `F`/`H`/`Q`/`R` now raise `ValueError`.
+- An `fx` or `hx` returning NaN/inf silently corrupted `x` and `P`, and the next
+  call failed with "unable to compute stable Cholesky factor". Both filters now
+  raise `ValueError` naming the callback and the sigma-point row, with `x` and
+  `P` unchanged.
+- The fixed-size Cholesky jitter rounded away to nothing for variances above
+  about 1.7e10, so singular covariances at that scale raised, and it swamped
+  variances below 1e-12 (NIS 0.083 instead of 0.25 in a two-clock example
+  expressed in seconds).
+- Built-in motion models silently mixed axes for FilterPy-style interleaved
+  states; see the new `layout` argument.
+- `nis` and `mahalanobis` are NaN, not 0, when the innovation distance is NaN,
+  so a broken update no longer passes `gate()`.
+- An `fx` or `hx` callback that raises no longer changes `jitter_count`,
+  `last_jitter` or `max_jitter`.
+- `copy()` and `from_dict()` lost the diagnostic counters after one step, and
+  neither filter could be pickled.
+- README paper citation: the authors are Yamagishi and Jing, and the title and
+  IEEE Access reference are now correct.
+- `CONTRIBUTING.md` rebuild command (the `-m pyproject.toml` form fails on
+  current maturin) and the `setup_env.sh` test hint, which ran `unittest` and
+  skipped the pytest-style tests. The `pyproject.toml` coverage comment no
+  longer claims a cargo test job.
 
 ## [0.8.0] - 2026-08-12
 
@@ -422,7 +421,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - KCKF-style AHRS update path from Yamagishi and Jing (arXiv:2602.12283).
 - Parity tests against FilterPy and benchmark scripts.
 
-[Unreleased]: https://github.com/mokhld/turbo-ckf/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/mokhld/turbo-ckf/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/mokhld/turbo-ckf/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/mokhld/turbo-ckf/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/mokhld/turbo-ckf/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/mokhld/turbo-ckf/compare/v0.5.0...v0.6.0
