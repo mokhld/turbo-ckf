@@ -37,6 +37,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   jitter is now relative to each diagonal entry, so results no longer depend
   on the units of the state. Results are unchanged whenever no jitter is
   needed; `last_jitter`/`max_jitter` still report the absolute amount added.
+- `TurboCKF` builds its cubature covariances from deviations about the mean in
+  `predict()`, `predict_linear_model_ckf()`, `predict_standard_model_ckf()`,
+  `update()` and `update_paper_ahrs()`. The previous `E[x x^T] - mean mean^T`
+  form cancelled when the state was far from zero: a constant-velocity filter
+  at an ECEF-sized position (6.4e6 m) raised "unable to compute stable
+  Cholesky factor" after 8 steps. It now matches the same filter run at the
+  origin to float64 resolution and matches `TurboSRCKF`. States near zero
+  change only at round-off level.
+- `nis` and `mahalanobis` are NaN, not 0, when the innovation distance is NaN,
+  so a broken update no longer passes `gate()`.
+- An `fx` or `hx` callback that raises no longer changes `jitter_count`,
+  `last_jitter` or `max_jitter`.
 - `rts_smooth` applied the wrong transition for time-varying models. With
   length-N `Fs`/`Qs` it used `Fs[k]`/`Qs[k]` for the k -> k+1 step, one step
   off from `batch_filter` and FilterPy's `rts_smoother`. It now uses
