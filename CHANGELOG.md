@@ -34,8 +34,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   current maturin) and the `setup_env.sh` test hint, which ran `unittest` and
   skipped the pytest-style tests.
 - The `pyproject.toml` coverage comment no longer claims a cargo test job.
+- Adaptive noise (`enable_adaptive_noise`) no longer raises "unable to compute
+  stable Cholesky factor" when `R` or `P` starts overestimated with
+  `dim_z >= 2` (14 to 20 of 20 runs crashed in the review scenarios). Only the
+  diagonal of the written-back estimate was floored, so it could be
+  indefinite. `R`/`Q` write-backs are now projected onto symmetric matrices
+  with every eigenvalue at least `diagonal_floor`.
+- Adaptive `R` is estimated against the `R` actually applied on each update.
+  Under `update(z, R=...)` or `run(zs, Rs=...)` it used the stored `self.R`,
+  which left the estimate with no fixed point.
 
 ### Changed
+- The adaptive `R` channel uses the residual-based estimate
+  `e e^T + H P_post H^T` (Akhlaghi et al. 2017) instead of `y y^T + R - S`.
+  Each contribution is positive semi-definite, so `R` no longer collapses to
+  the floor while `P` is overestimated. Eigenvalue projection alone stopped the
+  crash but let up to 12 of 20 runs diverge. Adaptive `R` trajectories differ
+  from 0.8.0 for the same inputs, and an adaptive update costs about 11 us more.
+- `diagonal_floor` in `enable_adaptive_noise` is an eigenvalue floor; the name
+  is unchanged.
 - README lists the exact wheel platforms (manylinux x86_64, macOS arm64,
   Windows x64) and notes that other platforms build from the sdist with a Rust
   toolchain.
