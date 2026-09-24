@@ -16,7 +16,38 @@ use pyo3::wrap_pyfunction;
 use rayon::prelude::*;
 use std::f64::consts::PI;
 
+/// Field names served by `CubatureKalmanFilter::get` and `snapshot`, and
+/// accepted by `set` and `load_snapshot`. They match the Python attributes.
+const CKF_FIELDS: [&str; 22] = [
+    "x",
+    "P",
+    "Q",
+    "R",
+    "K",
+    "y",
+    "z",
+    "S",
+    "SI",
+    "x_prior",
+    "P_prior",
+    "x_post",
+    "P_post",
+    "z_pred",
+    "log_likelihood",
+    "likelihood",
+    "mahalanobis",
+    "nis",
+    "last_jitter",
+    "max_jitter",
+    "jitter_count",
+    "singular_innovation_count",
+];
+
+/// The filter state lives here. The Python wrapper reads fields lazily with
+/// `get` and writes them with `set`, so nothing is copied across the FFI
+/// boundary unless the user reads or assigns it.
 #[pyclass]
+#[derive(Clone)]
 pub struct CubatureKalmanFilter {
     dim_x: usize,
     dim_z: usize,
@@ -190,12 +221,12 @@ impl CubatureKalmanFilter {
         Ok(())
     }
 
-    /// Clear cached innovation / likelihood diagnostics. Used by the Python
-    /// wrapper when a measurement is skipped (`update(z=None)`), so callers
-    /// don't accidentally re-read stale values.
+    /// Record a skipped measurement (`update(z=None)`): clear the innovation
+    /// and likelihood diagnostics so callers don't re-read stale values, set
+    /// `z` to NaN, and make the posterior equal the current prior.
     fn clear_update_diagnostics(&mut self) {
         self.y = DVector::zeros(self.dim_z);
-        self.z = DVector::zeros(self.dim_z);
+        self.z = DVector::from_element(self.dim_z, f64::NAN);
         self.z_pred = DVector::zeros(self.dim_z);
         self.s = DMatrix::identity(self.dim_z, self.dim_z);
         self.si = DMatrix::identity(self.dim_z, self.dim_z);
@@ -204,6 +235,8 @@ impl CubatureKalmanFilter {
         self.likelihood = f64::NAN;
         self.mahalanobis = f64::NAN;
         self.nis = f64::NAN;
+        self.x_post = self.x.clone();
+        self.p_post = self.p.clone();
     }
 
     fn reset_jitter_counters(&mut self) {
@@ -372,30 +405,105 @@ impl CubatureKalmanFilter {
         Ok(())
     }
 
+    /// Return one field by its Python attribute name, as a fresh numpy array
+    /// or a Python scalar.
+    fn get(&self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
+        Ok(match name {
+            "x" => dvector_to_object(py, &self.x),
+            "P" => dmatrix_to_object(py, &self.p)?,
+            "Q" => dmatrix_to_object(py, &self.q)?,
+            "R" => dmatrix_to_object(py, &self.r)?,
+            "K" => dmatrix_to_object(py, &self.k)?,
+            "y" => dvector_to_object(py, &self.y),
+            "z" => dvector_to_object(py, &self.z),
+            "S" => dmatrix_to_object(py, &self.s)?,
+            "SI" => dmatrix_to_object(py, &self.si)?,
+            "x_prior" => dvector_to_object(py, &self.x_prior),
+            "P_prior" => dmatrix_to_object(py, &self.p_prior)?,
+            "x_post" => dvector_to_object(py, &self.x_post),
+            "P_post" => dmatrix_to_object(py, &self.p_post)?,
+            "z_pred" => dvector_to_object(py, &self.z_pred),
+            "log_likelihood" => self.log_likelihood.to_object(py),
+            "likelihood" => self.likelihood.to_object(py),
+            "mahalanobis" => self.mahalanobis.to_object(py),
+            "nis" => self.nis.to_object(py),
+            "last_jitter" => self.last_jitter.to_object(py),
+            "max_jitter" => self.max_jitter.to_object(py),
+            "jitter_count" => self.jitter_count.to_object(py),
+            "singular_innovation_count" => self.singular_innovation_count.to_object(py),
+            _ => return Err(unknown_field(name)),
+        })
+    }
+
+    /// Overwrite one field by its Python attribute name. Arrays must be
+    /// float64 with the field's shape; x, P, Q and R must be finite.
+    fn set(&mut self, name: &str, value: &PyAny) -> PyResult<()> {
+        let (nx, nz) = (self.dim_x, self.dim_z);
+        match name {
+            "x" => self.x = finite_vector(value, nx, name)?,
+            "P" => self.p = finite_matrix(value, nx, nx, name)?,
+            "Q" => self.q = finite_matrix(value, nx, nx, name)?,
+            "R" => self.r = finite_matrix(value, nz, nz, name)?,
+            "K" => self.k = extract_matrix(value, nx, nz, name)?,
+            "y" => self.y = extract_vector(value, nz, name)?,
+            "z" => self.z = extract_vector(value, nz, name)?,
+            "S" => self.s = extract_matrix(value, nz, nz, name)?,
+            "SI" => self.si = extract_matrix(value, nz, nz, name)?,
+            "x_prior" => self.x_prior = extract_vector(value, nx, name)?,
+            "P_prior" => self.p_prior = extract_matrix(value, nx, nx, name)?,
+            "x_post" => self.x_post = extract_vector(value, nx, name)?,
+            "P_post" => self.p_post = extract_matrix(value, nx, nx, name)?,
+            "z_pred" => self.z_pred = extract_vector(value, nz, name)?,
+            "log_likelihood" => self.log_likelihood = value.extract()?,
+            "likelihood" => self.likelihood = value.extract()?,
+            "mahalanobis" => self.mahalanobis = value.extract()?,
+            "nis" => self.nis = value.extract()?,
+            "last_jitter" => self.last_jitter = value.extract()?,
+            "max_jitter" => self.max_jitter = value.extract()?,
+            "jitter_count" => self.jitter_count = value.extract()?,
+            "singular_innovation_count" => self.singular_innovation_count = value.extract()?,
+            _ => return Err(unknown_field(name)),
+        }
+        Ok(())
+    }
+
+    /// Inverse of `snapshot`: `set` every field present in `state`. Other
+    /// keys are ignored and absent fields keep their current values, so a
+    /// partial dict (for example an older `to_dict()` output) loads too.
+    fn load_snapshot(&mut self, state: &PyDict) -> PyResult<()> {
+        for name in CKF_FIELDS {
+            if let Some(value) = state.get_item(name)? {
+                self.set(name, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Independent copy of the whole filter, counters included.
+    fn copy(&self) -> Self {
+        self.clone()
+    }
+
+    /// Write row `i` of `run()`'s outputs: x_post, P_post, x_prior, P_prior,
+    /// log_likelihood and nis, in one call instead of six attribute reads.
+    fn record_step(&self, i: usize, out: &PyTuple) -> PyResult<()> {
+        record_row(
+            i,
+            out,
+            &self.x_post,
+            &self.p_post,
+            &self.x_prior,
+            &self.p_prior,
+            self.log_likelihood,
+            self.nis,
+        )
+    }
+
     fn snapshot(&self, py: Python<'_>) -> PyResult<PyObject> {
         let out = PyDict::new(py);
-        out.set_item("x", self.x.as_slice().to_pyarray(py))?;
-        out.set_item("P", dmatrix_to_pyarray(py, &self.p)?)?;
-        out.set_item("Q", dmatrix_to_pyarray(py, &self.q)?)?;
-        out.set_item("R", dmatrix_to_pyarray(py, &self.r)?)?;
-        out.set_item("K", dmatrix_to_pyarray(py, &self.k)?)?;
-        out.set_item("y", self.y.as_slice().to_pyarray(py))?;
-        out.set_item("z", self.z.as_slice().to_pyarray(py))?;
-        out.set_item("S", dmatrix_to_pyarray(py, &self.s)?)?;
-        out.set_item("SI", dmatrix_to_pyarray(py, &self.si)?)?;
-        out.set_item("x_prior", self.x_prior.as_slice().to_pyarray(py))?;
-        out.set_item("P_prior", dmatrix_to_pyarray(py, &self.p_prior)?)?;
-        out.set_item("x_post", self.x_post.as_slice().to_pyarray(py))?;
-        out.set_item("P_post", dmatrix_to_pyarray(py, &self.p_post)?)?;
-        out.set_item("z_pred", self.z_pred.as_slice().to_pyarray(py))?;
-        out.set_item("log_likelihood", self.log_likelihood)?;
-        out.set_item("likelihood", self.likelihood)?;
-        out.set_item("mahalanobis", self.mahalanobis)?;
-        out.set_item("nis", self.nis)?;
-        out.set_item("last_jitter", self.last_jitter)?;
-        out.set_item("max_jitter", self.max_jitter)?;
-        out.set_item("jitter_count", self.jitter_count)?;
-        out.set_item("singular_innovation_count", self.singular_innovation_count)?;
+        for name in CKF_FIELDS {
+            out.set_item(name, self.get(py, name)?)?;
+        }
         Ok(out.to_object(py))
     }
 }
@@ -800,6 +908,104 @@ fn dmatrix_to_pyarray<'py>(py: Python<'py>, mat: &DMatrix<f64>) -> PyResult<&'py
     let arr = numpy::ndarray::Array2::from_shape_vec((rows, cols), data)
         .map_err(|_| PyRuntimeError::new_err("failed to build numpy matrix shape"))?;
     Ok(arr.to_pyarray(py))
+}
+
+fn dvector_to_object(py: Python<'_>, v: &DVector<f64>) -> PyObject {
+    v.as_slice().to_pyarray(py).to_object(py)
+}
+
+fn dmatrix_to_object(py: Python<'_>, mat: &DMatrix<f64>) -> PyResult<PyObject> {
+    Ok(dmatrix_to_pyarray(py, mat)?.to_object(py))
+}
+
+fn extract_vector(value: &PyAny, expected: usize, name: &str) -> PyResult<DVector<f64>> {
+    pyarray1_to_dvector(value.extract()?, expected, name)
+}
+
+fn extract_matrix(
+    value: &PyAny,
+    expected_rows: usize,
+    expected_cols: usize,
+    name: &str,
+) -> PyResult<DMatrix<f64>> {
+    pyarray2_to_dmatrix(value.extract()?, expected_rows, expected_cols, name)
+}
+
+fn finite_vector(value: &PyAny, expected: usize, name: &str) -> PyResult<DVector<f64>> {
+    let v = extract_vector(value, expected, name)?;
+    require_finite(v.as_slice(), name)?;
+    Ok(v)
+}
+
+fn finite_matrix(
+    value: &PyAny,
+    expected_rows: usize,
+    expected_cols: usize,
+    name: &str,
+) -> PyResult<DMatrix<f64>> {
+    let m = extract_matrix(value, expected_rows, expected_cols, name)?;
+    require_finite(m.as_slice(), name)?;
+    Ok(m)
+}
+
+fn require_finite(values: &[f64], name: &str) -> PyResult<()> {
+    if values.iter().all(|v| v.is_finite()) {
+        return Ok(());
+    }
+    Err(PyValueError::new_err(format!(
+        "{name} must contain only finite values"
+    )))
+}
+
+fn unknown_field(name: &str) -> PyErr {
+    PyValueError::new_err(format!("unknown filter field: {name:?}"))
+}
+
+/// Write one step into `run()`'s preallocated outputs
+/// `(xs, Ps, x_priors, P_priors, log_likelihoods, nis)`.
+#[allow(clippy::too_many_arguments)]
+fn record_row(
+    i: usize,
+    out: &PyTuple,
+    x_post: &DVector<f64>,
+    p_post: &DMatrix<f64>,
+    x_prior: &DVector<f64>,
+    p_prior: &DMatrix<f64>,
+    log_likelihood: f64,
+    nis: f64,
+) -> PyResult<()> {
+    type Outputs<'py> = (
+        &'py PyArray2<f64>,
+        &'py PyArray3<f64>,
+        &'py PyArray2<f64>,
+        &'py PyArray3<f64>,
+        &'py PyArray1<f64>,
+        &'py PyArray1<f64>,
+    );
+    let (xs, ps, x_priors, p_priors, lls, nis_out): Outputs = out.extract()?;
+    let write_vector = |dst: &PyArray2<f64>, v: &DVector<f64>| {
+        let mut dst = dst.readwrite();
+        let mut row = dst.as_array_mut();
+        for (j, value) in v.iter().enumerate() {
+            row[[i, j]] = *value;
+        }
+    };
+    let write_matrix = |dst: &PyArray3<f64>, m: &DMatrix<f64>| {
+        let mut dst = dst.readwrite();
+        let mut arr = dst.as_array_mut();
+        for r in 0..m.nrows() {
+            for c in 0..m.ncols() {
+                arr[[i, r, c]] = m[(r, c)];
+            }
+        }
+    };
+    write_vector(xs, x_post);
+    write_matrix(ps, p_post);
+    write_vector(x_priors, x_prior);
+    write_matrix(p_priors, p_prior);
+    lls.readwrite().as_array_mut()[i] = log_likelihood;
+    nis_out.readwrite().as_array_mut()[i] = nis;
+    Ok(())
 }
 
 /// Rauch-Tung-Striebel fixed-interval smoother.
@@ -1423,7 +1629,69 @@ fn batch_parallel_step<'py>(
 //   Van der Merwe (PhD thesis, 2004) — SR-UKF Algorithm 3.2; the CKF case is
 //   the symmetric-weight specialisation (no separate central-point update).
 
+/// Field names served by `SquareRootCubatureKalmanFilter::get` and
+/// `snapshot`. P, Q, R, S, P_prior and P_post are products of the stored
+/// factors and are computed on request.
+const SR_FIELDS: [&str; 28] = [
+    "x",
+    "chol_P",
+    "P",
+    "chol_Q",
+    "Q",
+    "chol_R",
+    "R",
+    "K",
+    "y",
+    "z",
+    "S",
+    "S_innov",
+    "x_prior",
+    "P_prior",
+    "x_post",
+    "P_post",
+    "z_pred",
+    "log_likelihood",
+    "likelihood",
+    "mahalanobis",
+    "nis",
+    "last_jitter",
+    "max_jitter",
+    "jitter_count",
+    "singular_innovation_count",
+    "downdate_fallback_count",
+    "chol_P_prior",
+    "chol_P_post",
+];
+
+/// Fields `load_snapshot` restores. Covariances come back through their
+/// factors, so a restore never re-factors anything.
+const SR_STORED_FIELDS: [&str; 22] = [
+    "x",
+    "chol_P",
+    "chol_Q",
+    "chol_R",
+    "K",
+    "y",
+    "z",
+    "S_innov",
+    "x_prior",
+    "chol_P_prior",
+    "x_post",
+    "chol_P_post",
+    "z_pred",
+    "log_likelihood",
+    "likelihood",
+    "mahalanobis",
+    "nis",
+    "last_jitter",
+    "max_jitter",
+    "jitter_count",
+    "singular_innovation_count",
+    "downdate_fallback_count",
+];
+
 #[pyclass]
+#[derive(Clone)]
 pub struct SquareRootCubatureKalmanFilter {
     dim_x: usize,
     dim_z: usize,
@@ -1449,12 +1717,15 @@ pub struct SquareRootCubatureKalmanFilter {
     likelihood: f64,
     mahalanobis: f64,
     nis: f64,
-    // SR-CKF diagnostics. `jitter_count` is kept for API symmetry with the
-    // standard CKF, but the square-root path only invokes `stable_cholesky`
-    // when the user (re)seeds P / Q / R via `set_state` — never inside the
-    // filter loop. `downdate_fallback_count` increments when a rank-1
-    // Cholesky downdate of the posterior factor would produce a non-PD
-    // result and we fall back to a fresh Cholesky of the rebuilt P_post.
+    // SR-CKF diagnostics. `stable_cholesky` runs when P, Q or R is assigned
+    // (one seeding factorization each), when `update` gets a per-call R, and
+    // when a posterior downdate falls back to a fresh Cholesky. Every call
+    // that adds jitter counts in `jitter_count` and `max_jitter`;
+    // `last_jitter` is the largest jitter added during the most recent
+    // predict/update (or assignment, if no step has run since).
+    // `downdate_fallback_count` increments when a rank-1 Cholesky downdate
+    // of the posterior factor would produce a non-PD result and we fall back
+    // to a fresh Cholesky of the rebuilt P_post.
     last_jitter: f64,
     max_jitter: f64,
     jitter_count: u64,
@@ -1501,44 +1772,15 @@ impl SquareRootCubatureKalmanFilter {
         })
     }
 
-    /// Seed the filter from a covariance-space description.
-    ///
-    /// P, Q, R are accepted as full covariance matrices; their Cholesky
-    /// factors are computed once here via `stable_cholesky`. Any jitter that
-    /// had to be added at seeding time is recorded in the counters, but the
-    /// subsequent filter loop never touches `stable_cholesky` on P again —
-    /// so the typical predict-time jitter accumulation seen in the standard
-    /// CKF cannot happen.
+    /// Seed the filter from a covariance-space description: equivalent to
+    /// `set("x", x)`, `set("P", p)`, `set("Q", q)`, `set("R", r)`. Each
+    /// covariance is factored once; jitter added there is counted.
     #[pyo3(signature = (x, p, q, r))]
-    fn set_state(
-        &mut self,
-        x: PyReadonlyArray1<f64>,
-        p: PyReadonlyArray2<f64>,
-        q: PyReadonlyArray2<f64>,
-        r: PyReadonlyArray2<f64>,
-    ) -> PyResult<()> {
-        self.x = pyarray1_to_dvector(x, self.dim_x, "x")?;
-        let p_mat = pyarray2_to_dmatrix(p, self.dim_x, self.dim_x, "P")?;
-        let q_mat = pyarray2_to_dmatrix(q, self.dim_x, self.dim_x, "Q")?;
-        let r_mat = pyarray2_to_dmatrix(r, self.dim_z, self.dim_z, "R")?;
-        let (chol_p, jitter_p) = stable_cholesky(&p_mat)?;
-        let (chol_q, jitter_q) = stable_cholesky(&q_mat)?;
-        let (chol_r, jitter_r) = stable_cholesky(&r_mat)?;
-        self.chol_p = chol_p;
-        self.chol_q = chol_q;
-        self.chol_r = chol_r;
-        // Surface the worst seed-time jitter so callers can see if their
-        // P/Q/R were degenerate. We do NOT bump jitter_count for these —
-        // they're a one-shot cost at seeding, not the per-step silent
-        // jitter the standard CKF accumulates.
-        let worst = jitter_p.max(jitter_q).max(jitter_r);
-        if worst > self.last_jitter {
-            self.last_jitter = worst;
-        }
-        if worst > self.max_jitter {
-            self.max_jitter = worst;
-        }
-        Ok(())
+    fn set_state(&mut self, x: &PyAny, p: &PyAny, q: &PyAny, r: &PyAny) -> PyResult<()> {
+        self.set("x", x)?;
+        self.set("P", p)?;
+        self.set("Q", q)?;
+        self.set("R", r)
     }
 
     /// Update the default time step used by predict_custom when no per-call
@@ -1594,15 +1836,17 @@ impl SquareRootCubatureKalmanFilter {
         self.chol_p = chol_p_new;
         self.x_prior = self.x.clone();
         self.chol_p_prior = self.chol_p.clone();
+        // The QR predict never calls stable_cholesky.
+        self.last_jitter = 0.0;
         Ok(())
     }
 
-    /// Clear cached innovation / likelihood diagnostics. Used by the Python
-    /// wrapper when a measurement is skipped (`update(z=None)`), so callers
-    /// don't accidentally re-read stale values.
+    /// Record a skipped measurement (`update(z=None)`): clear the innovation
+    /// and likelihood diagnostics so callers don't re-read stale values, set
+    /// `z` to NaN, and make the posterior equal the current prior.
     fn clear_update_diagnostics(&mut self) {
         self.y = DVector::zeros(self.dim_z);
-        self.z = DVector::zeros(self.dim_z);
+        self.z = DVector::from_element(self.dim_z, f64::NAN);
         self.z_pred = DVector::zeros(self.dim_z);
         self.s_innov = DMatrix::identity(self.dim_z, self.dim_z);
         self.k = DMatrix::zeros(self.dim_x, self.dim_z);
@@ -1610,6 +1854,8 @@ impl SquareRootCubatureKalmanFilter {
         self.likelihood = f64::NAN;
         self.mahalanobis = f64::NAN;
         self.nis = f64::NAN;
+        self.x_post = self.x.clone();
+        self.chol_p_post = self.chol_p.clone();
     }
 
     fn reset_jitter_counters(&mut self) {
@@ -1633,16 +1879,10 @@ impl SquareRootCubatureKalmanFilter {
         let m_dim = self.dim_z;
         let z_vec = pyarray1_to_dvector(z, m_dim, "z")?;
         require_finite_measurement(&z_vec)?;
+        self.last_jitter = 0.0;
         let chol_r_local = if let Some(mat) = r {
             let r_mat = pyarray2_to_dmatrix(mat, m_dim, m_dim, "R")?;
-            let (chol_r, jitter) = stable_cholesky(&r_mat)?;
-            if jitter > 0.0 {
-                self.last_jitter = jitter;
-                if jitter > self.max_jitter {
-                    self.max_jitter = jitter;
-                }
-            }
-            chol_r
+            self.factor(&r_mat)?
         } else {
             self.chol_r.clone()
         };
@@ -1724,15 +1964,7 @@ impl SquareRootCubatureKalmanFilter {
             let p_old = &self.chol_p * self.chol_p.transpose();
             let mut p_post = p_old - &u * u.transpose();
             symmetrize_in_place(&mut p_post);
-            let (chol, jitter) = stable_cholesky(&p_post)?;
-            self.chol_p = chol;
-            if jitter > 0.0 {
-                self.last_jitter = jitter;
-                if jitter > self.max_jitter {
-                    self.max_jitter = jitter;
-                }
-                self.jitter_count = self.jitter_count.saturating_add(1);
-            }
+            self.chol_p = self.factor(&p_post)?;
             self.downdate_fallback_count = self.downdate_fallback_count.saturating_add(1);
         }
 
@@ -1776,41 +2008,132 @@ impl SquareRootCubatureKalmanFilter {
         Ok(())
     }
 
+    /// Return one field by its Python attribute name, as a fresh numpy array
+    /// or a Python scalar. Covariances are products of the stored factors.
+    fn get(&self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
+        let product = |l: &DMatrix<f64>| dmatrix_to_object(py, &(l * l.transpose()));
+        Ok(match name {
+            "x" => dvector_to_object(py, &self.x),
+            "chol_P" => dmatrix_to_object(py, &self.chol_p)?,
+            "P" => product(&self.chol_p)?,
+            "chol_Q" => dmatrix_to_object(py, &self.chol_q)?,
+            "Q" => product(&self.chol_q)?,
+            "chol_R" => dmatrix_to_object(py, &self.chol_r)?,
+            "R" => product(&self.chol_r)?,
+            "K" => dmatrix_to_object(py, &self.k)?,
+            "y" => dvector_to_object(py, &self.y),
+            "z" => dvector_to_object(py, &self.z),
+            "S" => product(&self.s_innov)?,
+            "S_innov" => dmatrix_to_object(py, &self.s_innov)?,
+            "x_prior" => dvector_to_object(py, &self.x_prior),
+            "P_prior" => product(&self.chol_p_prior)?,
+            "chol_P_prior" => dmatrix_to_object(py, &self.chol_p_prior)?,
+            "x_post" => dvector_to_object(py, &self.x_post),
+            "P_post" => product(&self.chol_p_post)?,
+            "chol_P_post" => dmatrix_to_object(py, &self.chol_p_post)?,
+            "z_pred" => dvector_to_object(py, &self.z_pred),
+            "log_likelihood" => self.log_likelihood.to_object(py),
+            "likelihood" => self.likelihood.to_object(py),
+            "mahalanobis" => self.mahalanobis.to_object(py),
+            "nis" => self.nis.to_object(py),
+            "last_jitter" => self.last_jitter.to_object(py),
+            "max_jitter" => self.max_jitter.to_object(py),
+            "jitter_count" => self.jitter_count.to_object(py),
+            "singular_innovation_count" => self.singular_innovation_count.to_object(py),
+            "downdate_fallback_count" => self.downdate_fallback_count.to_object(py),
+            _ => return Err(unknown_field(name)),
+        })
+    }
+
+    /// Overwrite one field by its Python attribute name. Assigning P, Q or R
+    /// factors it once with `stable_cholesky` and counts any jitter added;
+    /// the `chol_*` and `S_innov` names set a factor directly, with no
+    /// factorization. Arrays must be float64 with the field's shape; state
+    /// and factors must be finite.
+    fn set(&mut self, name: &str, value: &PyAny) -> PyResult<()> {
+        let (nx, nz) = (self.dim_x, self.dim_z);
+        match name {
+            "x" => self.x = finite_vector(value, nx, name)?,
+            "P" => self.chol_p = self.factor(&finite_matrix(value, nx, nx, name)?)?,
+            "Q" => self.chol_q = self.factor(&finite_matrix(value, nx, nx, name)?)?,
+            "R" => self.chol_r = self.factor(&finite_matrix(value, nz, nz, name)?)?,
+            "chol_P" => self.chol_p = finite_matrix(value, nx, nx, name)?,
+            "chol_Q" => self.chol_q = finite_matrix(value, nx, nx, name)?,
+            "chol_R" => self.chol_r = finite_matrix(value, nz, nz, name)?,
+            "chol_P_prior" => self.chol_p_prior = extract_matrix(value, nx, nx, name)?,
+            "chol_P_post" => self.chol_p_post = extract_matrix(value, nx, nx, name)?,
+            "S_innov" => self.s_innov = extract_matrix(value, nz, nz, name)?,
+            "K" => self.k = extract_matrix(value, nx, nz, name)?,
+            "y" => self.y = extract_vector(value, nz, name)?,
+            "z" => self.z = extract_vector(value, nz, name)?,
+            "x_prior" => self.x_prior = extract_vector(value, nx, name)?,
+            "x_post" => self.x_post = extract_vector(value, nx, name)?,
+            "z_pred" => self.z_pred = extract_vector(value, nz, name)?,
+            "log_likelihood" => self.log_likelihood = value.extract()?,
+            "likelihood" => self.likelihood = value.extract()?,
+            "mahalanobis" => self.mahalanobis = value.extract()?,
+            "nis" => self.nis = value.extract()?,
+            "last_jitter" => self.last_jitter = value.extract()?,
+            "max_jitter" => self.max_jitter = value.extract()?,
+            "jitter_count" => self.jitter_count = value.extract()?,
+            "singular_innovation_count" => self.singular_innovation_count = value.extract()?,
+            "downdate_fallback_count" => self.downdate_fallback_count = value.extract()?,
+            _ => return Err(unknown_field(name)),
+        }
+        Ok(())
+    }
+
+    /// Inverse of `snapshot`: `set` every stored field present in `state`
+    /// (factors, not their products, so nothing is re-factored). Other keys
+    /// are ignored and absent fields keep their current values.
+    fn load_snapshot(&mut self, state: &PyDict) -> PyResult<()> {
+        for name in SR_STORED_FIELDS {
+            if let Some(value) = state.get_item(name)? {
+                self.set(name, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Independent copy of the whole filter, factors and counters included.
+    fn copy(&self) -> Self {
+        self.clone()
+    }
+
+    /// Write row `i` of `run()`'s outputs (see the CKF method of the same
+    /// name); P_post and P_prior are products of their factors.
+    fn record_step(&self, i: usize, out: &PyTuple) -> PyResult<()> {
+        record_row(
+            i,
+            out,
+            &self.x_post,
+            &(&self.chol_p_post * self.chol_p_post.transpose()),
+            &self.x_prior,
+            &(&self.chol_p_prior * self.chol_p_prior.transpose()),
+            self.log_likelihood,
+            self.nis,
+        )
+    }
+
     fn snapshot(&self, py: Python<'_>) -> PyResult<PyObject> {
         let out = PyDict::new(py);
-        let p = &self.chol_p * self.chol_p.transpose();
-        let p_prior = &self.chol_p_prior * self.chol_p_prior.transpose();
-        let p_post = &self.chol_p_post * self.chol_p_post.transpose();
-        let q = &self.chol_q * self.chol_q.transpose();
-        let r = &self.chol_r * self.chol_r.transpose();
-        let s = &self.s_innov * self.s_innov.transpose();
-        out.set_item("x", self.x.as_slice().to_pyarray(py))?;
-        out.set_item("chol_P", dmatrix_to_pyarray(py, &self.chol_p)?)?;
-        out.set_item("P", dmatrix_to_pyarray(py, &p)?)?;
-        out.set_item("chol_Q", dmatrix_to_pyarray(py, &self.chol_q)?)?;
-        out.set_item("Q", dmatrix_to_pyarray(py, &q)?)?;
-        out.set_item("chol_R", dmatrix_to_pyarray(py, &self.chol_r)?)?;
-        out.set_item("R", dmatrix_to_pyarray(py, &r)?)?;
-        out.set_item("K", dmatrix_to_pyarray(py, &self.k)?)?;
-        out.set_item("y", self.y.as_slice().to_pyarray(py))?;
-        out.set_item("z", self.z.as_slice().to_pyarray(py))?;
-        out.set_item("S", dmatrix_to_pyarray(py, &s)?)?;
-        out.set_item("S_innov", dmatrix_to_pyarray(py, &self.s_innov)?)?;
-        out.set_item("x_prior", self.x_prior.as_slice().to_pyarray(py))?;
-        out.set_item("P_prior", dmatrix_to_pyarray(py, &p_prior)?)?;
-        out.set_item("x_post", self.x_post.as_slice().to_pyarray(py))?;
-        out.set_item("P_post", dmatrix_to_pyarray(py, &p_post)?)?;
-        out.set_item("z_pred", self.z_pred.as_slice().to_pyarray(py))?;
-        out.set_item("log_likelihood", self.log_likelihood)?;
-        out.set_item("likelihood", self.likelihood)?;
-        out.set_item("mahalanobis", self.mahalanobis)?;
-        out.set_item("nis", self.nis)?;
-        out.set_item("last_jitter", self.last_jitter)?;
-        out.set_item("max_jitter", self.max_jitter)?;
-        out.set_item("jitter_count", self.jitter_count)?;
-        out.set_item("singular_innovation_count", self.singular_innovation_count)?;
-        out.set_item("downdate_fallback_count", self.downdate_fallback_count)?;
+        for name in SR_FIELDS {
+            out.set_item(name, self.get(py, name)?)?;
+        }
         Ok(out.to_object(py))
+    }
+}
+
+impl SquareRootCubatureKalmanFilter {
+    /// `stable_cholesky` that counts any jitter it adds.
+    fn factor(&mut self, m: &DMatrix<f64>) -> PyResult<DMatrix<f64>> {
+        let (chol, jitter) = stable_cholesky(m)?;
+        if jitter > 0.0 {
+            self.last_jitter = self.last_jitter.max(jitter);
+            self.max_jitter = self.max_jitter.max(jitter);
+            self.jitter_count = self.jitter_count.saturating_add(1);
+        }
+        Ok(chol)
     }
 }
 

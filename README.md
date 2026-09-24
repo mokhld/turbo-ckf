@@ -108,6 +108,41 @@ inf raises a `ValueError` naming it, and the state is left unchanged. In
 `batch_parallel_step`, a filter whose own `x`, `P` or `z` is non-finite gets
 status 3 and is skipped while the rest of the bank updates.
 
+### Filter state lives in Rust
+
+The Rust backend holds `x`, `P`, `Q`, `R` and every diagnostic (`K`, `y`, `S`,
+`x_prior`, `P_post`, `log_likelihood`, `nis`, the jitter counters). An
+attribute is copied into NumPy only when you read it, and that copy is reused
+until the next `predict`/`update`, so a loop that reads nothing pays nothing
+for state sync.
+
+In-place edits work as in FilterPy. The array returned by `kf.x`, `kf.P`,
+`kf.Q` or `kf.R` is the filter's current value, and writing into it
+(`kf.x[0] = 1.0`, `kf.P[2:, 2:] *= 1000`) takes effect on the next call. Once a
+`predict`/`update` or an assignment replaces the value, the array you held
+becomes a read-only snapshot, so a late write raises `ValueError` instead of
+being dropped silently, and `history.append(kf.x)` needs no `.copy()`.
+Assignment copies your array into the filter. Output arrays such as `kf.K` are
+snapshots that do not feed back into the filter, and `TurboSRCKF`'s `chol_P`,
+`chol_Q`, `chol_R` are read-only. Reading never changes results; in
+`TurboSRCKF` it never re-factors `P` either.
+
+`copy()`, `to_dict()`/`from_dict()` and `pickle` keep the diagnostic counters,
+and `reset()` zeroes them. Pickling stores `fx` and `hx` by reference, so use
+module-level functions (a lambda makes `pickle` raise). `TurboSRCKF.to_dict()`
+stores `chol_P`, so restoring does not re-factor `P`.
+
+Per step, 4-state / 2-measurement constant-velocity model with a vectorized
+`hx`, Apple M4 Max, median of 7 runs:
+
+| Loop | State copied every call | State in Rust |
+| --- | --- | --- |
+| `predict_standard_model` + `update` | 12.6 us | 4.1 us |
+| same, reading `kf.x` and `kf.P` each step | 12.5 us | 4.7 us |
+| `predict` + `update` with `fx`/`hx` callbacks | 15.7 us | 6.8 us |
+| `TurboSRCKF` `predict` + `update` | 18.9 us | 6.6 us |
+| `run()` over 10,000 steps (total) | 182 ms | 51 ms |
+
 ### Filtering a whole sequence
 
 `run(...)` wraps the predict/update loop, stacks the per-step outputs, and

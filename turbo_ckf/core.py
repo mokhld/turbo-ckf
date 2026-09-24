@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 import numpy as np
@@ -125,7 +126,11 @@ def _normalize_run_measurements(
                 + (" or (N,)" if dim_z == 1 else "")
                 + f"; got shape {np.asarray(zs).shape}"
             )
-        entries: list[Vector | None] = [np.ascontiguousarray(row) for row in arr]
+        arr = np.ascontiguousarray(arr)
+        if arr.shape[0] and np.all(np.isfinite(arr)):
+            # Common case: one vectorized check instead of one per row.
+            return list(arr)
+        entries: list[Vector | None] = list(arr)
     else:
         entries = []
         for i, z in enumerate(zs):
@@ -210,18 +215,33 @@ def _run_filter(
     p_priors = np.empty((n, kf.dim_x, kf.dim_x), dtype=float)
     lls = np.empty(n, dtype=float)
     nis = np.empty(n, dtype=float)
-    missing = np.zeros(n, dtype=bool)
+    missing = np.array([z is None for z in entries], dtype=bool)
+    outputs = (xs, ps, x_priors, p_priors, lls, nis)
 
+    # The same backend calls predict()/update() make, with the callback
+    # wrappers and args built once instead of per step; each step's outputs
+    # are written straight into the result arrays. With adaptive noise on,
+    # the update goes through kf.update() so the estimator sees every step.
+    backend = kf._rust_backend
+    fx = kf._make_backend_model(kf.fx, expected_dim=kf.dim_x, include_dt=True)
+    hx = kf._make_backend_model(kf.hx, expected_dim=kf.dim_z, include_dt=False)
+    fx_call_args = TurboCKF._coerce_args(fx_args)
+    hx_call_args = TurboCKF._coerce_args(hx_args)
+    default_dt = kf.dt
+    kf._sync()
     for i, z in enumerate(entries):
-        kf.predict(dt=step_dts[i], fx_args=fx_args)
-        kf.update(z, R=step_rs[i], hx_args=hx_args)
-        xs[i] = kf.x_post
-        ps[i] = kf.P_post
-        x_priors[i] = kf.x_prior
-        p_priors[i] = kf.P_prior
-        lls[i] = kf.log_likelihood
-        nis[i] = kf.nis
-        missing[i] = z is None
+        dt = step_dts[i]
+        backend.predict_custom(fx, default_dt if dt is None else dt, fx_call_args)
+        kf._stepped()
+        if z is None:
+            backend.clear_update_diagnostics()
+            kf._stepped(())
+        elif kf._adaptive is None:
+            backend.update(z, hx, step_rs[i], hx_call_args)
+            kf._stepped()
+        else:
+            kf.update(z, R=step_rs[i], hx_args=hx_args)
+        backend.record_step(i, outputs)
 
     return FilterRun(
         xs=xs,
@@ -426,59 +446,140 @@ class _AdaptiveNoiseEstimator:
         return est
 
 
-class _ValidatedStateMixin:
-    """Coercing property views over the core filter state.
+# Snapshot fields that are vectors; from_dict flattens (n, 1) spellings.
+_VECTOR_FIELDS = frozenset({"x", "y", "z", "x_prior", "x_post", "z_pred"})
+
+
+class _Output:
+    """Lazy view of one backend output (``K``, ``y``, ``x_prior``, counters).
+
+    Fetched from the backend on first read and cached until the next backend
+    call, so a loop that never reads it never pays for the copy. Assigning
+    stores a Python-side value that is not sent to the backend; like any
+    output, it is replaced by the next backend call.
+    """
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self.name = name
+
+    def __get__(self, obj: Any, objtype: type | None = None) -> Any:
+        if obj is None:
+            return self
+        try:
+            return obj._cache[self.name]
+        except KeyError:
+            value = obj._cache[self.name] = obj._rust_backend.get(self.name)
+            return value
+
+    def __set__(self, obj: Any, value: Any) -> None:
+        obj._cache[self.name] = value
+
+
+class _Factor(_Output):
+    """Read-only view of a :class:`TurboSRCKF` Cholesky factor.
+
+    The returned array is read-only as well. Assign ``P``, ``Q`` or ``R`` to
+    change a factor.
+    """
+
+    def __get__(self, obj: Any, objtype: type | None = None) -> Any:
+        if obj is None:
+            return self
+        try:
+            return obj._cache[self.name]
+        except KeyError:
+            arr = obj._cache[self.name] = obj._rust_backend.get(self.name)
+            arr.setflags(write=False)
+            return arr
+
+    def __set__(self, obj: Any, value: Any) -> None:
+        raise AttributeError(
+            f"{self.name} is read-only; assign {self.name[len('chol_'):]} to change it"
+        )
+
+
+class _BackendStateMixin:
+    """FilterPy-style attributes over filter state owned by the Rust backend.
+
+    The backend holds ``x``, ``P``, ``Q``, ``R`` and every diagnostic.
+    Reading an attribute fetches it on first access and caches it until the
+    next backend call, and nothing is copied for attributes you never read.
 
     ``x``, ``P``, ``Q``, ``R`` and ``dt`` accept the spellings people
     actually write (plain lists, integer arrays, column vectors, scalars or
     diagonals for covariances) and normalize them to the float64 layouts the
     Rust backend needs. Invalid shapes, sizes, and non-finite values raise
-    at assignment time with the attribute name in the message, rather than
-    surfacing later as an opaque conversion error inside predict()/update().
+    at assignment time with the attribute name in the message. Assignment
+    copies the value into the backend immediately.
+
+    The array returned by ``x``, ``P``, ``Q`` or ``R`` is the filter's
+    current value: writing into it in place (``kf.x[0] = 1.0``,
+    ``kf.P[2:, 2:] *= 1000``) takes effect on the next backend call. Once a
+    predict/update or an assignment replaces that value, the array you held
+    becomes a read-only snapshot, so a late write raises instead of being
+    silently lost.
     """
 
     dim_x: int
     dim_z: int
+    hx: Callable[..., npt.ArrayLike]
+    fx: Callable[..., npt.ArrayLike]
+    _rust_backend: Any
+    # x/P/Q/R arrays handed out and still current: name -> (array, its bytes
+    # when it last matched the backend). _sync() pushes the ones that differ.
+    _live: dict[str, tuple[np.ndarray, bytes]]
+    # Outputs fetched (or assigned) since the last backend call.
+    _cache: dict[str, Any]
+    _adaptive: _AdaptiveNoiseEstimator | None = None
+    # Set by each filter class.
+    _BACKEND: Any
+    _KEPT_ON_RESET: tuple[str, ...]
+    _REQUIRED_KEYS: tuple[str, ...]
+
+    def _init_backend(self, backend: Any) -> None:
+        self._rust_backend = backend
+        self._live = {}
+        self._cache = {}
 
     @property
     def x(self) -> Vector:
         """State mean, shape ``(dim_x,)``."""
 
-        return self._x
+        return self._get_live("x")
 
     @x.setter
     def x(self, value: npt.ArrayLike) -> None:
-        self._x = _coerce_state_vector(value, self.dim_x, "x")
+        self._assign("x", _coerce_state_vector(value, self.dim_x, "x"))
 
     @property
     def P(self) -> Matrix:
         """State covariance, shape ``(dim_x, dim_x)``."""
 
-        return self._P
+        return self._get_live("P")
 
     @P.setter
     def P(self, value: npt.ArrayLike) -> None:
-        self._P = _coerce_square_matrix(value, self.dim_x, "P")
+        self._assign("P", _coerce_square_matrix(value, self.dim_x, "P"))
 
     @property
     def Q(self) -> Matrix:
         """Process-noise covariance, shape ``(dim_x, dim_x)``."""
 
-        return self._Q
+        return self._get_live("Q")
 
     @Q.setter
     def Q(self, value: npt.ArrayLike) -> None:
-        self._Q = _coerce_square_matrix(value, self.dim_x, "Q")
+        self._assign("Q", _coerce_square_matrix(value, self.dim_x, "Q"))
 
     @property
     def R(self) -> Matrix:
         """Measurement-noise covariance, shape ``(dim_z, dim_z)``."""
 
-        return self._R
+        return self._get_live("R")
 
     @R.setter
     def R(self, value: npt.ArrayLike) -> None:
-        self._R = _coerce_square_matrix(value, self.dim_z, "R")
+        self._assign("R", _coerce_square_matrix(value, self.dim_z, "R"))
 
     @property
     def dt(self) -> float:
@@ -503,8 +604,164 @@ class _ValidatedStateMixin:
         if backend is not None:
             backend.set_dt(val)
 
+    # ----- backend sync ------------------------------------------------------
 
-class TurboCKF(_ValidatedStateMixin):
+    def _get_live(self, name: str) -> np.ndarray:
+        entry = self._live.get(name)
+        if entry is None:
+            arr = self._rust_backend.get(name)
+            self._live[name] = (arr, arr.tobytes())
+            return arr
+        return entry[0]
+
+    def _assign(self, name: str, arr: np.ndarray) -> None:
+        entry = self._live.get(name)
+        self._rust_backend.set(name, arr)
+        if entry is not None and entry[0] is arr:
+            # The live array was edited and assigned back (``kf.P *= 2``);
+            # it stays the current value.
+            self._live[name] = (arr, arr.tobytes())
+        else:
+            self._retire((name,))
+        # Assigning P, Q or R re-factors them in TurboSRCKF, which can move
+        # the jitter counters, so drop every cached output.
+        self._cache.clear()
+
+    def _retire(self, names: tuple[str, ...]) -> None:
+        for name in names:
+            entry = self._live.pop(name, None)
+            if entry is not None:
+                entry[0].setflags(write=False)
+
+    def _sync(self) -> None:
+        """Prepare for a backend call: push in-place edits of handed-out
+        x/P/Q/R arrays and drop cached outputs.
+
+        Unedited arrays are skipped, so reading an attribute never changes
+        the numbers or re-factors anything. The output cache is dropped here
+        as well as in _stepped(), so a call that raises after moving a
+        counter cannot leave a stale value behind."""
+
+        self._cache.clear()
+        for name, (arr, synced) in self._live.items():
+            if arr.tobytes() != synced:
+                self._rust_backend.set(name, arr)
+                self._live[name] = (arr, arr.tobytes())
+
+    def _stepped(self, replaced: tuple[str, ...] = ("x", "P")) -> None:
+        """Invalidate cached values after a backend call. ``replaced`` names
+        the x/P/Q/R values the call changed; arrays handed out for them
+        become read-only snapshots."""
+
+        self._cache.clear()
+        self._retire(replaced)
+
+    # ----- copy / serialization / reset ------------------------------------
+
+    def copy(self) -> Any:
+        """Return an independent filter with the same state, dimensions,
+        callbacks, diagnostics and counters. Useful for Monte-Carlo runs."""
+
+        self._sync()
+        new = type(self)(self.dim_x, self.dim_z, self.dt, hx=self.hx, fx=self.fx)
+        new._init_backend(self._rust_backend.copy())
+        if self._adaptive is not None:
+            new._adaptive = _AdaptiveNoiseEstimator.from_state(self._adaptive.to_state())
+        return new
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Any:
+        return self.copy()
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # Pickle through to_dict(). fx/hx are pickled by reference, so
+        # module-level functions work and a lambda or nested function
+        # raises pickle's own error naming it.
+        return (type(self).from_dict, (self.to_dict(), self.hx, self.fx))
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the filter to a plain dict: dimensions, ``dt``, every
+        backend field (as returned by ``snapshot()``, counters included) and
+        the adaptive-noise estimator state if enabled. ndarrays are kept as
+        ndarrays. Callbacks are not included; :meth:`from_dict` takes them
+        again."""
+
+        self._sync()
+        out: dict[str, Any] = {
+            "version": 1,
+            "dim_x": self.dim_x,
+            "dim_z": self.dim_z,
+            "dt": self.dt,
+        }
+        out.update(self._rust_backend.snapshot())
+        if self._adaptive is not None:
+            out["adaptive"] = self._adaptive.to_state()
+        return out
+
+    @classmethod
+    def from_dict(
+        cls,
+        state: Mapping[str, Any],
+        hx: Callable[..., npt.ArrayLike],
+        fx: Callable[..., npt.ArrayLike],
+    ) -> Any:
+        """Reconstruct a filter from :meth:`to_dict` output. State,
+        diagnostics and counters are restored as saved (a TurboSRCKF gets
+        its Cholesky factors back without re-factoring). Fields missing
+        from ``state`` keep their constructor defaults."""
+
+        version = state.get("version", 1)
+        if version != 1:
+            raise ValueError(f"unsupported {cls.__name__} dict version: {version!r}")
+        missing = [key for key in cls._REQUIRED_KEYS if key not in state]
+        if missing:
+            raise ValueError(f"{cls.__name__} dict is missing {missing}")
+        kf = cls(
+            dim_x=int(state["dim_x"]),
+            dim_z=int(state["dim_z"]),
+            dt=float(state["dt"]),
+            hx=hx,
+            fx=fx,
+        )
+        fields: dict[str, Any] = {}
+        for name, value in state.items():
+            if isinstance(value, (list, tuple, np.ndarray)):
+                arr = np.ascontiguousarray(value, dtype=float)
+                value = arr.reshape(-1) if name in _VECTOR_FIELDS else arr
+            fields[name] = value
+        kf._rust_backend.load_snapshot(fields)
+        adaptive_state = state.get("adaptive")
+        if adaptive_state is not None:
+            kf._adaptive = _AdaptiveNoiseEstimator.from_state(adaptive_state)
+        return kf
+
+    def reset(self, x: npt.ArrayLike | None = None, P: npt.ArrayLike | None = None) -> None:
+        """Reset state to the constructor defaults (or supplied values) and
+        clear all diagnostics and counters. ``Q``, ``R``, ``dt``, ``fx``,
+        ``hx`` are preserved. Any adaptive-noise estimator is dropped; call
+        ``enable_adaptive_noise()`` again to restart it."""
+
+        x_new = (
+            np.zeros(self.dim_x, dtype=float)
+            if x is None
+            else _coerce_state_vector(x, self.dim_x, "x")
+        )
+        P_new = (
+            np.eye(self.dim_x, dtype=float)
+            if P is None
+            else _coerce_square_matrix(P, self.dim_x, "P")
+        )
+        self._sync()
+        kept = {name: self._rust_backend.get(name) for name in self._KEPT_ON_RESET}
+        self._rust_backend = self._BACKEND(self.dim_x, self.dim_z, self.dt)
+        self._rust_backend.load_snapshot(kept)
+        self._stepped()
+        self.x = x_new
+        self.P = P_new
+        # A fresh run should not inherit innovation evidence from the last one.
+        self._adaptive = None
+
+
+class TurboCKF(_BackendStateMixin):
     """Rust-backed Cubature Kalman Filter.
 
     Callback contract for ``fx`` and ``hx``: both must accept a batch of
@@ -512,7 +769,53 @@ class TurboCKF(_ValidatedStateMixin):
     shape ``(2 * dim_x, dim_x)`` (``fx``) or ``(2 * dim_x, dim_z)`` (``hx``).
     Pointwise callbacks (one sigma point at a time) are rejected — wrap them
     with ``np.apply_along_axis(..., axis=1)`` or vectorize directly.
+
+    State lives in the Rust backend. ``x``, ``P``, ``Q``, ``R`` are
+    read-write; ``K``, ``y``, ``z``, ``S``, ``SI``, ``x_prior``,
+    ``P_prior``, ``x_post``, ``P_post``, ``z_pred``, ``log_likelihood``,
+    ``likelihood``, ``mahalanobis``, ``nis`` and the counters
+    ``last_jitter``, ``max_jitter``, ``jitter_count``,
+    ``singular_innovation_count`` are outputs. Every attribute is fetched
+    from the backend on first read and cached until the next
+    predict/update, so a loop pays only for what it reads.
+
+    In-place edits: writing into the array returned by ``x``, ``P``, ``Q``
+    or ``R`` (``kf.x[0] = 1.0``, ``kf.P[2:, 2:] *= 1000``) takes effect on
+    the next predict/update. Arrays handed out before a predict/update (or
+    before an assignment) that replaced the value become read-only
+    snapshots, so a late write raises. Writing into an output array has no
+    effect on the filter.
+
+    ``copy()``, ``to_dict()``/``from_dict()`` and pickling keep the
+    diagnostic counters; ``reset()`` zeroes them. Pickling stores ``fx``
+    and ``hx`` by reference, so they must be module-level functions (or
+    other picklable callables).
     """
+
+    _BACKEND = _rust.CubatureKalmanFilter
+    _KEPT_ON_RESET = ("Q", "R")
+    _REQUIRED_KEYS = ("x", "P", "Q", "R")
+
+    K = _Output()
+    y = _Output()
+    z = _Output()
+    S = _Output()
+    SI = _Output()
+    x_prior = _Output()
+    P_prior = _Output()
+    x_post = _Output()
+    P_post = _Output()
+    z_pred = _Output()
+    log_likelihood = _Output()
+    likelihood = _Output()
+    mahalanobis = _Output()
+    nis = _Output()
+    # stable_cholesky jitter diagnostics. last_jitter is the jitter applied
+    # on the most recent step; max_jitter / jitter_count are cumulative.
+    last_jitter = _Output()
+    max_jitter = _Output()
+    jitter_count = _Output()
+    singular_innovation_count = _Output()
 
     def __init__(
         self,
@@ -533,41 +836,13 @@ class TurboCKF(_ValidatedStateMixin):
         self.hx = hx
         self.fx = fx
 
-        self.x: Vector = np.zeros(self.dim_x, dtype=float)
-        self.P: Matrix = np.eye(self.dim_x, dtype=float)
-        self.Q: Matrix = np.eye(self.dim_x, dtype=float)
-        self.R: Matrix = np.eye(self.dim_z, dtype=float)
-
-        self.K: Matrix = np.zeros((self.dim_x, self.dim_z), dtype=float)
-        self.y: Vector = np.zeros(self.dim_z, dtype=float)
-        self.z: Vector = np.zeros(self.dim_z, dtype=float)
-        self.S: Matrix = np.eye(self.dim_z, dtype=float)
-        self.SI: Matrix = np.eye(self.dim_z, dtype=float)
-
-        self.x_prior: Vector = self.x.copy()
-        self.P_prior: Matrix = self.P.copy()
-        self.x_post: Vector = self.x.copy()
-        self.P_post: Matrix = self.P.copy()
-
-        self.z_pred: Vector = np.zeros(self.dim_z, dtype=float)
-        self.log_likelihood: float = float("nan")
-        self.likelihood: float = float("nan")
-        self.mahalanobis: float = float("nan")
-        self.nis: float = float("nan")
-
-        # stable_cholesky jitter diagnostics — populated from the backend
-        # after each predict/update. last_jitter is the jitter applied on the
-        # most recent step; max_jitter / jitter_count are cumulative.
-        self.last_jitter: float = 0.0
-        self.max_jitter: float = 0.0
-        self.jitter_count: int = 0
-        self.singular_innovation_count: int = 0
-
         # Adaptive Q/R estimator. None when disabled (the default); set via
         # enable_adaptive_noise().
-        self._adaptive: _AdaptiveNoiseEstimator | None = None
+        self._adaptive = None
 
-        self._rust_backend = _rust.CubatureKalmanFilter(self.dim_x, self.dim_z, self.dt)
+        # The backend starts at x = 0, P = Q = R = I, with neutral
+        # diagnostics (NaN likelihoods) and zeroed counters.
+        self._init_backend(self._BACKEND(self.dim_x, self.dim_z, self.dt))
         self._backend_name = "rust"
 
     def __repr__(self) -> str:
@@ -588,18 +863,18 @@ class TurboCKF(_ValidatedStateMixin):
         """Run the time-update step."""
 
         local_dt = self.dt if dt is None else float(dt)
-        if not np.isfinite(local_dt):
+        if not math.isfinite(local_dt):
             raise ValueError("dt must be finite")
         transition = self.fx if fx is None else fx
         args = self._coerce_args(fx_args)
 
-        self._push_state_to_backend()
+        self._sync()
         self._rust_backend.predict_custom(
             self._make_backend_model(transition, expected_dim=self.dim_x, include_dt=True),
             local_dt,
             args,
         )
-        self._pull_state_from_backend()
+        self._stepped()
         return self.x
 
     def predict_standard_model(self, model_type: str, layout: str = "blocked") -> Vector:
@@ -620,9 +895,9 @@ class TurboCKF(_ValidatedStateMixin):
 
         self._validate_standard_model(model_type)
         _validate_standard_layout(layout)
-        self._push_state_to_backend()
+        self._sync()
         self._rust_backend.predict_standard_model(str(model_type), str(layout))
-        self._pull_state_from_backend()
+        self._stepped()
         return self.x
 
     def predict_standard_model_ckf(self, model_type: str, layout: str = "blocked") -> Vector:
@@ -636,27 +911,27 @@ class TurboCKF(_ValidatedStateMixin):
 
         self._validate_standard_model(model_type)
         _validate_standard_layout(layout)
-        self._push_state_to_backend()
+        self._sync()
         self._rust_backend.predict_standard_model_ckf(str(model_type), str(layout))
-        self._pull_state_from_backend()
+        self._stepped()
         return self.x
 
     def predict_linear_model(self, f: npt.ArrayLike) -> Vector:
         """Predict using KCKF equations with a caller-provided linear transition matrix."""
 
         f_mat = self._coerce_covariance(f, self.dim_x, "F")
-        self._push_state_to_backend()
+        self._sync()
         self._rust_backend.predict_linear_model(f_mat)
-        self._pull_state_from_backend()
+        self._stepped()
         return self.x
 
     def predict_linear_model_ckf(self, f: npt.ArrayLike) -> Vector:
         """Predict using CKF cubature summation equations with a caller-provided linear transition matrix."""
 
         f_mat = self._coerce_covariance(f, self.dim_x, "F")
-        self._push_state_to_backend()
+        self._sync()
         self._rust_backend.predict_linear_model_ckf(f_mat)
-        self._pull_state_from_backend()
+        self._stepped()
         return self.x
 
     # ----- update ----------------------------------------------------------
@@ -678,28 +953,27 @@ class TurboCKF(_ValidatedStateMixin):
         """
 
         if z is None:
-            self._push_state_to_backend()
+            # The backend sets x_post / P_post to the (unchanged) prior and
+            # z to NaN; x and P themselves are not replaced.
+            self._sync()
             self._rust_backend.clear_update_diagnostics()
-            self._pull_state_from_backend()
-            # x_post / P_post mirror the (now unchanged) prior.
-            self.x_post = self.x.copy()
-            self.P_post = self.P.copy()
-            self.z = np.full(self.dim_z, np.nan, dtype=float)
+            self._stepped(())
             return self.x
 
         measurement_fn = self.hx if hx is None else hx
         args = self._coerce_args(hx_args)
         z_vec = self._as_vector(z, self.dim_z, "z")
-        r_mat = self._coerce_covariance(self.R if R is None else R, self.dim_z, "R")
+        # None tells the backend to use its stored R.
+        r_mat = None if R is None else self._coerce_covariance(R, self.dim_z, "R")
 
-        self._push_state_to_backend()
+        self._sync()
         self._rust_backend.update(
             z_vec,
             self._make_backend_model(measurement_fn, expected_dim=self.dim_z, include_dt=False),
             r_mat,
             args,
         )
-        self._pull_state_from_backend()
+        self._stepped()
         self._apply_adaptive_noise(r_mat)
         return self.x
 
@@ -731,9 +1005,10 @@ class TurboCKF(_ValidatedStateMixin):
         if not np.isfinite(sigma_mag2) or sigma_mag2 <= 0.0:
             raise ValueError("sigma_mag2 must be finite and positive")
         z_vec = self._as_vector(z, self.dim_z, "z")
-        self._push_state_to_backend()
+        self._sync()
         self._rust_backend.update_paper_ahrs(z_vec, sigma_acc2, sigma_mag2)
-        self._pull_state_from_backend()
+        # The paper update also overwrites R.
+        self._stepped(("x", "P", "R"))
         return self.x
 
     def run(
@@ -902,153 +1177,6 @@ class TurboCKF(_ValidatedStateMixin):
         if not np.isfinite(self.nis):
             return False
         return float(self.nis) <= float(threshold)
-
-    def reset(self, x: npt.ArrayLike | None = None, P: npt.ArrayLike | None = None) -> None:
-        """Reset state to the constructor defaults (or supplied values) and
-        clear all cached diagnostics. ``Q``, ``R``, ``dt``, ``fx``, ``hx``
-        are preserved."""
-
-        self.x = (
-            np.zeros(self.dim_x, dtype=float)
-            if x is None
-            else self._as_vector(x, self.dim_x, "x")
-        )
-        self.P = (
-            np.eye(self.dim_x, dtype=float)
-            if P is None
-            else self._coerce_covariance(P, self.dim_x, "P")
-        )
-        self.K = np.zeros((self.dim_x, self.dim_z), dtype=float)
-        self.y = np.zeros(self.dim_z, dtype=float)
-        self.z = np.zeros(self.dim_z, dtype=float)
-        self.S = np.eye(self.dim_z, dtype=float)
-        self.SI = np.eye(self.dim_z, dtype=float)
-        self.x_prior = self.x.copy()
-        self.P_prior = self.P.copy()
-        self.x_post = self.x.copy()
-        self.P_post = self.P.copy()
-        self.z_pred = np.zeros(self.dim_z, dtype=float)
-        self.log_likelihood = float("nan")
-        self.likelihood = float("nan")
-        self.mahalanobis = float("nan")
-        self.nis = float("nan")
-        self.last_jitter = 0.0
-        self.max_jitter = 0.0
-        self.jitter_count = 0
-        self.singular_innovation_count = 0
-        # Drop adaptive estimator state on reset — Q/R are back to defaults so
-        # an existing accumulator would carry stale evidence into a fresh run.
-        # Estimator config (window/mode/alpha) is forgotten too; users that
-        # want it back should re-call enable_adaptive_noise() after reset().
-        self._adaptive = None
-        # Rebuild the backend to drop its accumulated counters too.
-        self._rust_backend = _rust.CubatureKalmanFilter(self.dim_x, self.dim_z, self.dt)
-        self._push_state_to_backend()
-
-    def copy(self) -> "TurboCKF":
-        """Return an independent filter with the same state, dimensions,
-        callbacks, and diagnostics. Useful for Monte-Carlo runs."""
-
-        new = TurboCKF(self.dim_x, self.dim_z, self.dt, hx=self.hx, fx=self.fx)
-        new.x = self.x.copy()
-        new.P = self.P.copy()
-        new.Q = self.Q.copy()
-        new.R = self.R.copy()
-        new.K = self.K.copy()
-        new.y = self.y.copy()
-        new.z = self.z.copy()
-        new.S = self.S.copy()
-        new.SI = self.SI.copy()
-        new.x_prior = self.x_prior.copy()
-        new.P_prior = self.P_prior.copy()
-        new.x_post = self.x_post.copy()
-        new.P_post = self.P_post.copy()
-        new.z_pred = self.z_pred.copy()
-        new.log_likelihood = self.log_likelihood
-        new.likelihood = self.likelihood
-        new.mahalanobis = self.mahalanobis
-        new.nis = self.nis
-        new.last_jitter = self.last_jitter
-        new.max_jitter = self.max_jitter
-        new.jitter_count = self.jitter_count
-        new.singular_innovation_count = self.singular_innovation_count
-        if self._adaptive is not None:
-            new._adaptive = _AdaptiveNoiseEstimator.from_state(self._adaptive.to_state())
-        new._push_state_to_backend()
-        return new
-
-    def __deepcopy__(self, memo: dict[int, Any]) -> "TurboCKF":
-        return self.copy()
-
-    def to_dict(self) -> dict[str, Any]:
-        """Serialize the filter state to a plain dict (ndarrays kept as
-        ndarrays). Callbacks are *not* included — restoring requires the
-        caller to re-supply them via :meth:`from_dict`."""
-
-        out = {
-            "version": 1,
-            "dim_x": self.dim_x,
-            "dim_z": self.dim_z,
-            "dt": self.dt,
-            "x": self.x.copy(),
-            "P": self.P.copy(),
-            "Q": self.Q.copy(),
-            "R": self.R.copy(),
-            "x_prior": self.x_prior.copy(),
-            "P_prior": self.P_prior.copy(),
-            "x_post": self.x_post.copy(),
-            "P_post": self.P_post.copy(),
-            "log_likelihood": self.log_likelihood,
-            "likelihood": self.likelihood,
-            "mahalanobis": self.mahalanobis,
-            "nis": self.nis,
-            "jitter_count": self.jitter_count,
-            "max_jitter": self.max_jitter,
-            "singular_innovation_count": self.singular_innovation_count,
-        }
-        if self._adaptive is not None:
-            out["adaptive"] = self._adaptive.to_state()
-        return out
-
-    @classmethod
-    def from_dict(
-        cls,
-        state: Mapping[str, Any],
-        hx: Callable[..., npt.ArrayLike],
-        fx: Callable[..., npt.ArrayLike],
-    ) -> "TurboCKF":
-        """Reconstruct a filter from :meth:`to_dict` output."""
-
-        version = state.get("version", 1)
-        if version != 1:
-            raise ValueError(f"unsupported TurboCKF dict version: {version!r}")
-        kf = cls(
-            dim_x=int(state["dim_x"]),
-            dim_z=int(state["dim_z"]),
-            dt=float(state["dt"]),
-            hx=hx,
-            fx=fx,
-        )
-        kf.x = np.array(state["x"], dtype=float, copy=True).reshape(-1)
-        kf.P = np.array(state["P"], dtype=float, copy=True)
-        kf.Q = np.array(state["Q"], dtype=float, copy=True)
-        kf.R = np.array(state["R"], dtype=float, copy=True)
-        kf.x_prior = np.array(state.get("x_prior", kf.x), dtype=float, copy=True).reshape(-1)
-        kf.P_prior = np.array(state.get("P_prior", kf.P), dtype=float, copy=True)
-        kf.x_post = np.array(state.get("x_post", kf.x), dtype=float, copy=True).reshape(-1)
-        kf.P_post = np.array(state.get("P_post", kf.P), dtype=float, copy=True)
-        kf.log_likelihood = float(state.get("log_likelihood", float("nan")))
-        kf.likelihood = float(state.get("likelihood", float("nan")))
-        kf.mahalanobis = float(state.get("mahalanobis", float("nan")))
-        kf.nis = float(state.get("nis", float("nan")))
-        kf.jitter_count = int(state.get("jitter_count", 0))
-        kf.max_jitter = float(state.get("max_jitter", 0.0))
-        kf.singular_innovation_count = int(state.get("singular_innovation_count", 0))
-        adaptive_state = state.get("adaptive")
-        if adaptive_state is not None:
-            kf._adaptive = _AdaptiveNoiseEstimator.from_state(adaptive_state)
-        kf._push_state_to_backend()
-        return kf
 
     @staticmethod
     def batch_filter(
@@ -1342,10 +1470,11 @@ class TurboCKF(_ValidatedStateMixin):
         norm = float(np.linalg.norm(self.x))
         if not np.isfinite(norm) or norm <= 0.0:
             raise ValueError("quaternion norm must be finite and positive")
-        self.x = self.x / norm
-        # Keep x_post in sync so introspection reads aren't stale until the
-        # next snapshot from the backend.
-        self.x_post = self.x.copy()
+        x_unit = self.x / norm
+        self._sync()
+        # x_post follows x, as in the backend normalization.
+        self._rust_backend.load_snapshot({"x": x_unit, "x_post": x_unit})
+        self._stepped(("x",))
         return self.x
 
     def normalize_state_quaternion_backend(self) -> Vector:
@@ -1353,46 +1482,12 @@ class TurboCKF(_ValidatedStateMixin):
 
         if self.dim_x != 4:
             raise ValueError("normalize_state_quaternion_backend requires dim_x == 4")
-        self._push_state_to_backend()
+        self._sync()
         self._rust_backend.normalize_quaternion_state()
-        self._pull_state_from_backend()
+        self._stepped(("x",))
         return self.x
 
     # ----- internals -------------------------------------------------------
-
-    def _push_state_to_backend(self) -> None:
-        self._rust_backend.set_state(self._x, self._P, self._Q, self._R)
-
-    def _pull_state_from_backend(self) -> None:
-        # The Rust snapshot already returns fresh numpy buffers (via
-        # `ToPyArray::to_pyarray`, which allocates a new PyArray per call),
-        # so `np.asarray` here is a zero-copy adoption — no aliasing risk to
-        # the backend struct's internal storage. Writes go to the private
-        # slots directly: backend output is already float64 and well-shaped,
-        # so the coercing property setters would only add per-step overhead.
-        snap = self._rust_backend.snapshot()
-        self._x = np.asarray(snap["x"], dtype=float).reshape(-1)
-        self._P = np.asarray(snap["P"], dtype=float)
-        self._Q = np.asarray(snap["Q"], dtype=float)
-        self._R = np.asarray(snap["R"], dtype=float)
-        self.K = np.asarray(snap["K"], dtype=float)
-        self.y = np.asarray(snap["y"], dtype=float).reshape(-1)
-        self.z = np.asarray(snap["z"], dtype=float).reshape(-1)
-        self.S = np.asarray(snap["S"], dtype=float)
-        self.SI = np.asarray(snap["SI"], dtype=float)
-        self.x_prior = np.asarray(snap["x_prior"], dtype=float).reshape(-1)
-        self.P_prior = np.asarray(snap["P_prior"], dtype=float)
-        self.x_post = np.asarray(snap["x_post"], dtype=float).reshape(-1)
-        self.P_post = np.asarray(snap["P_post"], dtype=float)
-        self.z_pred = np.asarray(snap["z_pred"], dtype=float).reshape(-1)
-        self.log_likelihood = float(snap["log_likelihood"])
-        self.likelihood = float(snap["likelihood"])
-        self.mahalanobis = float(snap["mahalanobis"])
-        self.nis = float(snap["nis"])
-        self.last_jitter = float(snap["last_jitter"])
-        self.max_jitter = float(snap["max_jitter"])
-        self.jitter_count = int(snap["jitter_count"])
-        self.singular_innovation_count = int(snap["singular_innovation_count"])
 
     def _make_backend_model(
         self,
@@ -1562,20 +1657,33 @@ class TurboCKF(_ValidatedStateMixin):
         return (args,)
 
 
-class TurboSRCKF(_ValidatedStateMixin):
+class TurboSRCKF(_BackendStateMixin):
     """Square-root Cubature Kalman Filter (SR-CKF).
 
     Propagates the lower-triangular Cholesky factor of P directly instead of
     P itself. Predict step uses a single QR of stacked weighted sigma-point
     deltas + ``chol(Q)``; update uses one QR for the innovation factor plus
-    ``dim_z`` rank-1 Cholesky downdates for the posterior factor. The full
-    filter loop never calls ``stable_cholesky`` on P — so the silent
-    jitter-on-the-diagonal hazard that the standard :class:`TurboCKF`
-    accumulates at every predict simply doesn't exist here.
+    ``dim_z`` rank-1 Cholesky downdates for the posterior factor. The
+    factor ``chol_P`` stays in the Rust backend across steps, and P is
+    factored only when you assign it (one seeding ``stable_cholesky``).
+    Inside the loop ``stable_cholesky`` runs only for a per-call ``R`` passed
+    to :meth:`update` and when a downdate falls back to a fresh Cholesky
+    (``downdate_fallback_count``). Jitter added by any of these, including
+    the seeding factorization, counts in ``jitter_count`` and
+    ``max_jitter``; call :meth:`reset_jitter_counters` after seeding to
+    count only in-loop jitter.
 
     Same vectorised callback contract as :class:`TurboCKF`: ``fx`` and ``hx``
     take ``(2 * dim_x, dim_x)`` batches of sigma points and return
     ``(2 * dim_x, dim_x)`` and ``(2 * dim_x, dim_z)`` respectively.
+
+    State ownership and in-place edits follow :class:`TurboCKF`. ``P``,
+    ``Q``, ``R`` (and ``S``, ``P_prior``, ``P_post``) are computed from the
+    factors when read, so reading ``kf.P`` right after assigning it returns
+    ``chol_P @ chol_P.T``, including any seeding jitter. Reading never
+    re-factors. An in-place edit of ``kf.P``, ``kf.Q`` or ``kf.R`` is
+    factored once at the next predict/update, like an assignment.
+    ``chol_P``, ``chol_Q`` and ``chol_R`` are read-only.
 
     Only the ``predict_custom`` + ``update`` API surface from TurboCKF is
     mirrored here. For linear closed-form predicts or the paper AHRS update
@@ -1583,6 +1691,35 @@ class TurboSRCKF(_ValidatedStateMixin):
     bounded by per-step measurements anyway, so the SR variant is lower
     leverage).
     """
+
+    _BACKEND = _rust.SquareRootCubatureKalmanFilter
+    _KEPT_ON_RESET = ("chol_Q", "chol_R")
+    _REQUIRED_KEYS = ("x", "chol_P", "chol_Q", "chol_R")
+
+    chol_P = _Factor()
+    chol_Q = _Factor()
+    chol_R = _Factor()
+    K = _Output()
+    y = _Output()
+    z = _Output()
+    S = _Output()
+    S_innov = _Output()
+    x_prior = _Output()
+    P_prior = _Output()
+    x_post = _Output()
+    P_post = _Output()
+    z_pred = _Output()
+    log_likelihood = _Output()
+    likelihood = _Output()
+    mahalanobis = _Output()
+    nis = _Output()
+    # Diagnostics mirror TurboCKF's surface; downdate_fallback_count is
+    # specific to the square-root posterior path.
+    last_jitter = _Output()
+    max_jitter = _Output()
+    jitter_count = _Output()
+    singular_innovation_count = _Output()
+    downdate_fallback_count = _Output()
 
     def __init__(
         self,
@@ -1603,43 +1740,9 @@ class TurboSRCKF(_ValidatedStateMixin):
         self.hx = hx
         self.fx = fx
 
-        # State + factor view.
-        self.x: Vector = np.zeros(self.dim_x, dtype=float)
-        self.P: Matrix = np.eye(self.dim_x, dtype=float)
-        self.chol_P: Matrix = np.eye(self.dim_x, dtype=float)
-        self.Q: Matrix = np.eye(self.dim_x, dtype=float)
-        self.chol_Q: Matrix = np.eye(self.dim_x, dtype=float)
-        self.R: Matrix = np.eye(self.dim_z, dtype=float)
-        self.chol_R: Matrix = np.eye(self.dim_z, dtype=float)
-
-        self.K: Matrix = np.zeros((self.dim_x, self.dim_z), dtype=float)
-        self.y: Vector = np.zeros(self.dim_z, dtype=float)
-        self.z: Vector = np.zeros(self.dim_z, dtype=float)
-        self.S: Matrix = np.eye(self.dim_z, dtype=float)
-        self.S_innov: Matrix = np.eye(self.dim_z, dtype=float)
-
-        self.x_prior: Vector = self.x.copy()
-        self.P_prior: Matrix = self.P.copy()
-        self.x_post: Vector = self.x.copy()
-        self.P_post: Matrix = self.P.copy()
-
-        self.z_pred: Vector = np.zeros(self.dim_z, dtype=float)
-        self.log_likelihood: float = float("nan")
-        self.likelihood: float = float("nan")
-        self.mahalanobis: float = float("nan")
-        self.nis: float = float("nan")
-
-        # Diagnostics mirror TurboCKF's surface; downdate_fallback_count is
-        # specific to the square-root posterior path.
-        self.last_jitter: float = 0.0
-        self.max_jitter: float = 0.0
-        self.jitter_count: int = 0
-        self.singular_innovation_count: int = 0
-        self.downdate_fallback_count: int = 0
-
-        self._rust_backend = _rust.SquareRootCubatureKalmanFilter(
-            self.dim_x, self.dim_z, self.dt
-        )
+        # The backend starts at x = 0 and identity factors for P, Q, R,
+        # with neutral diagnostics and zeroed counters.
+        self._init_backend(self._BACKEND(self.dim_x, self.dim_z, self.dt))
         self._backend_name = "rust-sr"
 
     def __repr__(self) -> str:
@@ -1662,18 +1765,18 @@ class TurboSRCKF(_ValidatedStateMixin):
         """Time-update step (mirrors ``TurboCKF.predict``)."""
 
         local_dt = self.dt if dt is None else float(dt)
-        if not np.isfinite(local_dt):
+        if not math.isfinite(local_dt):
             raise ValueError("dt must be finite")
         transition = self.fx if fx is None else fx
         args = TurboCKF._coerce_args(fx_args)
 
-        self._push_state_to_backend()
+        self._sync()
         self._rust_backend.predict_custom(
             self._make_backend_model(transition, expected_dim=self.dim_x, include_dt=True),
             local_dt,
             args,
         )
-        self._pull_state_from_backend()
+        self._stepped()
         return self.x
 
     # ----- update ----------------------------------------------------------
@@ -1693,27 +1796,28 @@ class TurboSRCKF(_ValidatedStateMixin):
         """
 
         if z is None:
-            self._push_state_to_backend()
+            # The backend sets x_post / P_post to the (unchanged) prior and
+            # z to NaN; x and P themselves are not replaced.
+            self._sync()
             self._rust_backend.clear_update_diagnostics()
-            self._pull_state_from_backend()
-            self.x_post = self.x.copy()
-            self.P_post = self.P.copy()
-            self.z = np.full(self.dim_z, np.nan, dtype=float)
+            self._stepped(())
             return self.x
 
         measurement_fn = self.hx if hx is None else hx
         args = TurboCKF._coerce_args(hx_args)
         z_vec = TurboCKF._as_vector(z, self.dim_z, "z")
-        r_mat = TurboCKF._coerce_covariance(self.R if R is None else R, self.dim_z, "R")
+        # None uses the stored chol_R; a per-call R is factored for this
+        # update only.
+        r_mat = None if R is None else TurboCKF._coerce_covariance(R, self.dim_z, "R")
 
-        self._push_state_to_backend()
+        self._sync()
         self._rust_backend.update(
             z_vec,
             self._make_backend_model(measurement_fn, expected_dim=self.dim_z, include_dt=False),
             r_mat,
             args,
         )
-        self._pull_state_from_backend()
+        self._stepped()
         return self.x
 
     def run(
@@ -1743,43 +1847,6 @@ class TurboSRCKF(_ValidatedStateMixin):
             return False
         return float(self.nis) <= float(threshold)
 
-    def reset(self, x: npt.ArrayLike | None = None, P: npt.ArrayLike | None = None) -> None:
-        """Reset state + diagnostics. ``Q``, ``R``, ``dt``, ``fx``, ``hx`` are preserved."""
-
-        self.x = (
-            np.zeros(self.dim_x, dtype=float)
-            if x is None
-            else TurboCKF._as_vector(x, self.dim_x, "x")
-        )
-        self.P = (
-            np.eye(self.dim_x, dtype=float)
-            if P is None
-            else TurboCKF._coerce_covariance(P, self.dim_x, "P")
-        )
-        self.K = np.zeros((self.dim_x, self.dim_z), dtype=float)
-        self.y = np.zeros(self.dim_z, dtype=float)
-        self.z = np.zeros(self.dim_z, dtype=float)
-        self.S = np.eye(self.dim_z, dtype=float)
-        self.S_innov = np.eye(self.dim_z, dtype=float)
-        self.x_prior = self.x.copy()
-        self.P_prior = self.P.copy()
-        self.x_post = self.x.copy()
-        self.P_post = self.P.copy()
-        self.z_pred = np.zeros(self.dim_z, dtype=float)
-        self.log_likelihood = float("nan")
-        self.likelihood = float("nan")
-        self.mahalanobis = float("nan")
-        self.nis = float("nan")
-        self.last_jitter = 0.0
-        self.max_jitter = 0.0
-        self.jitter_count = 0
-        self.singular_innovation_count = 0
-        self.downdate_fallback_count = 0
-        self._rust_backend = _rust.SquareRootCubatureKalmanFilter(
-            self.dim_x, self.dim_z, self.dt
-        )
-        self._push_state_to_backend()
-
     def reset_jitter_counters(self) -> None:
         """Zero all jitter / downdate diagnostics after seeding state.
 
@@ -1788,48 +1855,9 @@ class TurboSRCKF(_ValidatedStateMixin):
         """
 
         self._rust_backend.reset_jitter_counters()
-        self.last_jitter = 0.0
-        self.max_jitter = 0.0
-        self.jitter_count = 0
-        self.singular_innovation_count = 0
-        self.downdate_fallback_count = 0
+        self._cache.clear()
 
     # ----- internals -------------------------------------------------------
-
-    def _push_state_to_backend(self) -> None:
-        self._rust_backend.set_state(self._x, self._P, self._Q, self._R)
-
-    def _pull_state_from_backend(self) -> None:
-        # Private-slot writes: backend output is already float64 and
-        # well-shaped, so the coercing property setters would only add
-        # per-step overhead.
-        snap = self._rust_backend.snapshot()
-        self._x = np.asarray(snap["x"], dtype=float).reshape(-1)
-        self.chol_P = np.asarray(snap["chol_P"], dtype=float)
-        self._P = np.asarray(snap["P"], dtype=float)
-        self.chol_Q = np.asarray(snap["chol_Q"], dtype=float)
-        self._Q = np.asarray(snap["Q"], dtype=float)
-        self.chol_R = np.asarray(snap["chol_R"], dtype=float)
-        self._R = np.asarray(snap["R"], dtype=float)
-        self.K = np.asarray(snap["K"], dtype=float)
-        self.y = np.asarray(snap["y"], dtype=float).reshape(-1)
-        self.z = np.asarray(snap["z"], dtype=float).reshape(-1)
-        self.S = np.asarray(snap["S"], dtype=float)
-        self.S_innov = np.asarray(snap["S_innov"], dtype=float)
-        self.x_prior = np.asarray(snap["x_prior"], dtype=float).reshape(-1)
-        self.P_prior = np.asarray(snap["P_prior"], dtype=float)
-        self.x_post = np.asarray(snap["x_post"], dtype=float).reshape(-1)
-        self.P_post = np.asarray(snap["P_post"], dtype=float)
-        self.z_pred = np.asarray(snap["z_pred"], dtype=float).reshape(-1)
-        self.log_likelihood = float(snap["log_likelihood"])
-        self.likelihood = float(snap["likelihood"])
-        self.mahalanobis = float(snap["mahalanobis"])
-        self.nis = float(snap["nis"])
-        self.last_jitter = float(snap["last_jitter"])
-        self.max_jitter = float(snap["max_jitter"])
-        self.jitter_count = int(snap["jitter_count"])
-        self.singular_innovation_count = int(snap["singular_innovation_count"])
-        self.downdate_fallback_count = int(snap["downdate_fallback_count"])
 
     def _make_backend_model(
         self,

@@ -18,8 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   held NaN or inf and its update was skipped. A bad `z_i` returns the
   predict-step output with log-likelihood -inf; a bad `x_i`/`P_i` returns the
   inputs unchanged with log-likelihood NaN. The rest of the bank still updates.
+- `TurboSRCKF.copy()`, `to_dict()`, `from_dict()` and `__deepcopy__`.
+- Pickle support for `TurboCKF` and `TurboSRCKF`, built on `to_dict()`; `fx`/`hx`
+  are pickled by reference, so module-level functions work.
 
 ### Fixed
+- `TurboSRCKF` re-factored P on every call, because the wrapper pushed
+  `chol_P chol_P^T` back to Rust before each step, and it did not count the
+  jitter that added (jitter on 5000 of 5000 steps in the ill-conditioned test,
+  with `jitter_count` 0). `chol_P` now stays in Rust across steps.
+- `copy()` and `from_dict()` lost the diagnostic counters after one step, and
+  neither filter could be pickled.
 - `batch_filter` returned NaN for every step after a NaN/inf observation
   without raising. It now raises `ValueError` naming the first bad row
   (`zs[k]`) and pointing to `run(..., nan_means_missing=True)`. Non-finite
@@ -97,6 +106,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variances of the unit-vector components, so values tuned against raw-unit
   input need retuning. `kf.z` and `kf.y` hold the normalized measurement and
   its innovation.
+- Filter state lives in the Rust backend. Attributes are fetched when read and
+  cached until the next call, and only in-place edits are pushed back. For a
+  4-state/2-measurement model: `predict_standard_model` + `update` 12.6 -> 4.1
+  us/step, callback `predict` + `update` 15.7 -> 6.8, `TurboSRCKF` 18.9 -> 6.6,
+  `run()` over 10k steps 182 -> 51 ms.
+- Writes into the arrays returned by `kf.x`/`P`/`Q`/`R` take effect on the next
+  call. Arrays replaced by a predict/update or an assignment become read-only,
+  so writing to one raises `ValueError` instead of being silently lost.
+- Assigning `x`/`P`/`Q`/`R` copies the value; later edits to the caller's own
+  array no longer reach the filter.
+- `TurboSRCKF` factors P/Q/R once when assigned (or at the next call after an
+  in-place edit), and a P that cannot be factored raises at assignment. Seed
+  and per-call-R jitter now count in `jitter_count`, and `last_jitter` is the
+  jitter of the most recent step. `chol_P`/`chol_Q`/`chol_R` are read-only.
+- After `update(z=None)`, `x_post`/`P_post` (equal to the prior) and `z` (NaN)
+  persist until the next real update.
+- `to_dict()` includes every backend field; older dicts still load.
+  `from_dict()` raises `ValueError`, not `KeyError`, when required fields are
+  missing. `copy.copy(kf)` returns an independent filter.
 
 ## [0.8.0] - 2026-08-12
 

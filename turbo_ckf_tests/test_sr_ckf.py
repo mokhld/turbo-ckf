@@ -124,12 +124,13 @@ def test_srckf_matches_ckf_on_pure_predict_chain():
 def test_srckf_jitter_count_stays_zero_on_ill_conditioned_run():
     """On a near-rank-deficient initial P (eigenvalue ratio ~1e18) with tiny
     R, TurboCKF must add diagonal jitter via stable_cholesky to keep P PD,
-    while TurboSRCKF — which never re-decomposes P during the filter loop —
-    reports zero jitter.
+    while TurboSRCKF, which factors P once when it is assigned and never
+    again in the filter loop, adds none.
 
     The acceptance criterion is the inequality (CKF > 0, SR-CKF == 0), not
-    the magnitudes. The point is that silent jitter is impossible on the
-    square-root path in steady state.
+    the magnitudes. max_jitter is asserted as well as jitter_count because
+    jitter_count alone once missed a per-step re-factorization of P that
+    added 1e-10 of jitter on every step (REVIEW A3).
     """
 
     rng = np.random.default_rng(5)
@@ -154,6 +155,7 @@ def test_srckf_jitter_count_stays_zero_on_ill_conditioned_run():
     # counter naturally starts at zero too.
     srckf.reset_jitter_counters()
     assert srckf.jitter_count == 0
+    assert srckf.max_jitter == 0.0
     assert ckf.jitter_count == 0
 
     for _ in range(5000):
@@ -173,6 +175,10 @@ def test_srckf_jitter_count_stays_zero_on_ill_conditioned_run():
         f"fell back to a fresh Cholesky (downdate_fallback_count="
         f"{srckf.downdate_fallback_count}) or seed-time jitter leaked into "
         f"the per-step counter."
+    )
+    assert srckf.max_jitter == 0.0, (
+        f"TurboSRCKF added jitter inside the filter loop "
+        f"(max_jitter={srckf.max_jitter}); P is being re-factored per step."
     )
 
 
