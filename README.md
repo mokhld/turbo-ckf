@@ -47,7 +47,16 @@ If you pass pointwise callbacks, `TurboCKF` raises immediately.
 pip install turbo-ckf
 ```
 
-Wheels are published for CPython 3.9 - 3.13 on Linux, macOS, and Windows.
+Prebuilt wheels (one abi3 wheel per platform, CPython 3.9 or newer; CI tests
+3.9 to 3.13) are published for three platforms only:
+
+- Linux x86_64 (manylinux2014, glibc 2.17 or newer)
+- macOS arm64 (Apple silicon, macOS 11 or newer)
+- Windows x64
+
+Everywhere else, including Linux aarch64 (for example Raspberry Pi), musl Linux
+(Alpine) and Intel Macs, `pip` builds from the sdist. That needs a Rust
+toolchain on `PATH` (install one from https://rustup.rs).
 
 ## Install from source (development)
 
@@ -65,6 +74,22 @@ from turbo_ckf import TurboCKF
 kf = TurboCKF(dim_x=2, dim_z=1, dt=0.1, hx=hx_vectorized, fx=fx_vectorized)
 kf.predict_standard_model("constant_velocity")
 kf.update(z)
+```
+
+The built-in models, `"constant_velocity"` and `"constant_acceleration"`, need
+to know how the state vector is ordered. The default, `layout="blocked"`, is all
+positions, then all velocities, then all accelerations: `[x, y, vx, vy]` or
+`[x, y, vx, vy, ax, ay]`. FilterPy code usually orders the state per axis,
+`[x, vx, y, vy]` or `[x, vx, ax, y, vy, ay]`; pass `layout="interleaved"` for
+that. `predict_standard_model_ckf` takes the same argument. The layout cannot
+be inferred from the state, so a mismatch gives wrong predictions without an
+error. With `dim_x=2` (or 3 for constant acceleration) the two layouts are the
+same.
+
+```python
+# FilterPy-style 2-D state [x, vx, y, vy]
+kf = TurboCKF(dim_x=4, dim_z=2, dt=0.1, hx=hx_vectorized, fx=fx_vectorized)
+kf.predict_standard_model("constant_velocity", layout="interleaved")
 ```
 
 State assignment is forgiving about spelling: `x` accepts lists, integer
@@ -118,7 +143,7 @@ The filter needs `dim_x=4` (quaternion) and `dim_z=6`, and the update overwrites
 
 ## Benchmarks
 
-### Paper-Reported Targets (Shing et al., arXiv:2602.12283)
+### Paper-Reported Targets (Yamagishi and Jing, arXiv:2602.12283)
 
 These are the KCKF-vs-CKF results reported in the paper:
 
@@ -161,7 +186,7 @@ Interpretation:
 ## Research Basis
 
 - This repo is an implementation of the KCKF AHRS equations described in:
-  - Shing, Y. C., et al., "KCKF: A Fast and Stable Quaternion-Based Orientation Estimator", arXiv:2602.12283 (2026), https://arxiv.org/abs/2602.12283.
+  - Yamagishi, S. and Jing, L., "A Lightweight Cubature Kalman Filter for Attitude and Heading Reference Systems Using Simplified Prediction Equations", IEEE Access, vol. 14, pp. 73686-73697, 2026, doi:10.1109/ACCESS.2026.3686031. Preprint: arXiv:2602.12283, https://arxiv.org/abs/2602.12283.
 - Credit for the method belongs to the paper authors.
 
 ## License

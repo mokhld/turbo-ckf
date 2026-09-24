@@ -19,6 +19,15 @@ except Exception as exc:  # pragma: no cover
 
 
 _STANDARD_MODELS = tuple(_rust.CubatureKalmanFilter.supported_standard_models())
+_STANDARD_LAYOUTS = tuple(_rust.CubatureKalmanFilter.supported_standard_layouts())
+
+
+def _validate_standard_layout(layout: str) -> None:
+    name = str(layout)
+    if name not in _STANDARD_LAYOUTS:
+        choices = ", ".join(repr(m) for m in _STANDARD_LAYOUTS)
+        raise ValueError(f"unsupported layout {name!r}; expected one of {choices}")
+
 
 _ADAPTIVE_MODES = ("R", "Q", "both")
 
@@ -562,21 +571,42 @@ class TurboCKF(_ValidatedStateMixin):
         self._pull_state_from_backend()
         return self.x
 
-    def predict_standard_model(self, model_type: str) -> Vector:
-        """Predict with the lightweight (KCKF) linear equations."""
+    def predict_standard_model(self, model_type: str, layout: str = "blocked") -> Vector:
+        """Predict with the lightweight (KCKF) linear equations.
+
+        ``model_type`` is ``"constant_velocity"`` or ``"constant_acceleration"``,
+        stepped by the current ``dt``. ``layout`` is the order of the state vector:
+
+        - ``"blocked"`` (default): all positions, then all velocities, then all
+          accelerations, e.g. ``[x, y, vx, vy]`` or ``[x, y, vx, vy, ax, ay]``.
+        - ``"interleaved"``: one block per axis, as in FilterPy, e.g.
+          ``[x, vx, y, vy]`` or ``[x, vx, ax, y, vy, ay]``.
+
+        A state stored in the other layout is not detected: the prediction
+        silently mixes axes. ``dim_x`` must be a multiple of 2 for constant
+        velocity and of 3 for constant acceleration.
+        """
 
         self._validate_standard_model(model_type)
+        _validate_standard_layout(layout)
         self._push_state_to_backend()
-        self._rust_backend.predict_standard_model(str(model_type))
+        self._rust_backend.predict_standard_model(str(model_type), str(layout))
         self._pull_state_from_backend()
         return self.x
 
-    def predict_standard_model_ckf(self, model_type: str) -> Vector:
-        """Predict with the original CKF cubature-point summation equations."""
+    def predict_standard_model_ckf(self, model_type: str, layout: str = "blocked") -> Vector:
+        """Predict with the original CKF cubature-point summation equations.
+
+        Takes the same arguments as :meth:`predict_standard_model`. ``layout``
+        is ``"blocked"`` (default, ``[x, y, vx, vy]``) or ``"interleaved"``
+        (FilterPy order, ``[x, vx, y, vy]``); a state in the other layout
+        silently gives wrong predictions.
+        """
 
         self._validate_standard_model(model_type)
+        _validate_standard_layout(layout)
         self._push_state_to_backend()
-        self._rust_backend.predict_standard_model_ckf(str(model_type))
+        self._rust_backend.predict_standard_model_ckf(str(model_type), str(layout))
         self._pull_state_from_backend()
         return self.x
 

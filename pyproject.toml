@@ -57,6 +57,8 @@ source = ["turbo_ckf"]
 [tool.coverage.report]
 # CI enforces a ratchet floor via --cov-fail-under (currently 95; the real
 # baseline is 100% on the Python layer). Raise the floor — never lower it —
-# when coverage rises durably. The Rust backend (src/lib.rs) is covered by the
-# cargo test/clippy jobs, not this Python-layer gate.
+# when coverage rises durably. This gate measures the Python layer only. The
+# Rust backend (src/lib.rs) has no Rust unit tests and no cargo test job: CI
+# runs cargo fmt and clippy on it, and the pytest suite exercises it through
+# the Python bindings.
 show_missing = true

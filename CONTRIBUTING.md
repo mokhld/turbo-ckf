@@ -17,7 +17,7 @@ Python dev requirements, and builds the Rust extension via `maturin develop`.
 If you already have a Rust toolchain and just want to rebuild the extension:
 
 ```bash
-.venv-turbo-ckf/bin/python -m maturin develop --release -m pyproject.toml
+make build   # runs .venv-turbo-ckf/bin/python -m maturin develop --release
 ```
 
 ## Running tests
