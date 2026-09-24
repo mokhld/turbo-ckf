@@ -243,16 +243,34 @@ class _AdaptiveNoiseEstimator:
     estimator writes its current estimate back to the filter's ``R`` (and/or
     ``Q``) covariance on each successful update.
 
-    R-channel uses the canonical innovation-based relation
-    ``R_est = E[y y^T + R - S]``; in steady state this is unbiased even while
-    the filter is still adapting because ``E[y y^T] = H P_prior H^T + R_true``
-    and ``E[S] = H P_prior H^T + R_filter``.
+    R-channel uses the residual-based relation of Akhlaghi et al. (2017,
+    "Adaptive adjustment of noise covariance in Kalman filter for dynamic
+    state estimation"), ``R_est = E[e e^T + H P_post H^T]`` with the
+    post-update residual ``e = z - h(x_post)``. For a linear ``h``,
+    ``e = R S^-1 y`` and ``H P_post H^T = R - R S^-1 R``, so each step adds
+    ``R + R S^-1 (y y^T - S) S^-1 R``, computed from ``y``, ``S`` and the
+    ``R`` that built ``S``. That is exact for linear ``h`` and a
+    statistical-linearization approximation for a nonlinear ``hx`` (the
+    cubature ``S - R`` stands in for ``H P_prior H^T``). Every contribution
+    is positive semi-definite because ``S - R`` is, so the estimate cannot
+    go indefinite when ``P`` or ``R`` starts overestimated and ``y y^T``
+    falls below ``S - R``, which is where the innovation-based
+    ``E[y y^T + R - S]`` breaks down.
+    For a positive-definite ``R`` the fixed point is the ``R`` at which
+    ``E[y y^T] = S``.
 
     Q-channel uses the state-correction heuristic
     ``Q_est = E[K y y^T K^T]``. This is *not* an unbiased Q estimator and can
     destabilize the filter if used aggressively; callers opting into ``mode in
     ("Q", "both")`` should keep ``alpha`` small and verify NEES on a held-out
     trajectory.
+
+    Each write-back is projected onto the symmetric matrices whose
+    eigenvalues are all at least ``diagonal_floor``, so the ``R``/``Q``
+    handed to the filter are symmetric positive-definite. The running
+    averages behind ``estimate_R()``/``estimate_Q()`` are left unprojected:
+    both channels average positive semi-definite contributions already, and
+    clipping the running value would carry the added mass forward as bias.
     """
 
     __slots__ = (
@@ -326,14 +344,25 @@ class _AdaptiveNoiseEstimator:
     ) -> tuple[Matrix | None, Matrix | None]:
         """Fold one innovation/update into the running estimate.
 
+        ``R_current`` must be the ``R`` that built ``S`` (the per-call
+        override when one was passed to ``update``).
+
         Returns ``(new_R, new_Q)``. Either entry is ``None`` if (a) that
         channel is disabled, or (b) the estimator is still in the warm-up
         window (``count < window``).
         """
 
         outer_y = np.outer(y, y)
-        contrib_R = outer_y + R_current - S
         if self._adapt_R:
+            # e e^T + H P_post H^T written with y, S, R: e = R S^-1 y and
+            # H P_post H^T = R - R S^-1 R. S and R are symmetric, so
+            # R S^-1 = (S^-1 R)^T.
+            try:
+                gain = np.linalg.solve(S, R_current).T
+            except np.linalg.LinAlgError:
+                # Exactly singular S; the backend update used a pseudo-inverse.
+                gain = R_current @ np.linalg.pinv(S, hermitian=True)
+            contrib_R = R_current + gain @ (outer_y - S) @ gain.T
             self._update_running(self._estimate_R, contrib_R)
         if self._adapt_Q:
             contrib_Q = K @ outer_y @ K.T
@@ -360,11 +389,13 @@ class _AdaptiveNoiseEstimator:
             target += self.alpha * contrib_sym
 
     def _clamp_pd(self, mat: Matrix) -> Matrix:
-        out = 0.5 * (mat + mat.T)
-        diag = np.maximum(np.diagonal(out), self.diagonal_floor)
-        # np.diagonal returns a read-only view; reconstruct.
-        np.fill_diagonal(out, diag)
-        return out
+        # Nearest symmetric matrix (in Frobenius norm) with every eigenvalue
+        # >= diagonal_floor. Flooring only the diagonal is not enough: an
+        # estimate like [[f, c], [c, f]] with |c| > f stays indefinite.
+        sym = 0.5 * (mat + mat.T)
+        eigvals, eigvecs = np.linalg.eigh(sym)
+        out = (eigvecs * np.maximum(eigvals, self.diagonal_floor)) @ eigvecs.T
+        return 0.5 * (out + out.T)
 
     def to_state(self) -> dict[str, Any]:
         return {
@@ -669,7 +700,7 @@ class TurboCKF(_ValidatedStateMixin):
             args,
         )
         self._pull_state_from_backend()
-        self._apply_adaptive_noise()
+        self._apply_adaptive_noise(r_mat)
         return self.x
 
     def update_paper_ahrs(
@@ -786,19 +817,30 @@ class TurboCKF(_ValidatedStateMixin):
                 innovations before writing the first update back to
                 ``R``/``Q``. Setting this larger trades adaptation latency
                 for less noise in the initial estimate. Default 30.
-            mode: which noise covariance to adapt. One of ``"R"`` (canonical
-                — innovation-based, unbiased in steady state),
+            mode: which noise covariance to adapt. One of ``"R"``
+                (residual-based, after Akhlaghi et al. 2017: each update
+                adds ``e e^T + H P_post H^T``, which is positive
+                semi-definite, so the estimate cannot go indefinite when
+                ``R`` or ``P`` starts overestimated; exact for a linear
+                ``hx``, a statistical-linearization approximation otherwise),
                 ``"Q"`` (heuristic — state-correction outer-product; can
                 destabilize, keep ``alpha`` small and verify NEES on a
                 held-out trajectory), or ``"both"``. Default ``"R"``.
             alpha: EWMA forgetting factor in ``(0, 1]``. Larger values track
                 changes faster but produce noisier estimates. Typical
                 ``0.01..0.3``. Default ``0.3``.
-            diagonal_floor: lower bound clamped onto the diagonal of every
-                estimate write-back, keeping the adaptive covariances
-                positive-definite. Default ``1e-12``.
+            diagonal_floor: eigenvalue floor for every write-back. The
+                estimate is projected onto the symmetric matrices whose
+                eigenvalues are all at least this value, so the ``R``/``Q``
+                written to the filter are symmetric positive-definite.
+                Despite the name, it bounds eigenvalues, not only diagonal
+                entries. Default ``1e-12``.
 
         Notes:
+            - Adaptation uses the ``R`` actually applied on each update.
+              When ``update(z, R=...)`` or ``run(zs, Rs=...)`` overrides
+              ``R`` for a step, the estimate is formed against that
+              override; the written-back estimate still goes to ``self.R``.
             - Adaptive estimation runs on the standard ``update(z=...)``
               path only. ``update_paper_ahrs`` overwrites ``R`` from its
               ``sigma_acc2``/``sigma_mag2`` arguments on every call, so the
@@ -829,7 +871,10 @@ class TurboCKF(_ValidatedStateMixin):
 
         return self._adaptive
 
-    def _apply_adaptive_noise(self) -> None:
+    def _apply_adaptive_noise(self, R_used: Matrix | None = None) -> None:
+        # R_used is the R that built this update's S: the per-call override
+        # when one was passed, or None when the stored self.R was used.
+        # Passing self.R under an override skews the estimate by the gap.
         if self._adaptive is None:
             return
         if not (np.all(np.isfinite(self.y)) and np.all(np.isfinite(self.S))):
@@ -837,7 +882,7 @@ class TurboCKF(_ValidatedStateMixin):
         new_R, new_Q = self._adaptive.step(
             y=self.y,
             S=self.S,
-            R_current=self.R,
+            R_current=self.R if R_used is None else R_used,
             K=self.K,
         )
         if new_R is not None:
