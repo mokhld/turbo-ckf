@@ -1094,6 +1094,11 @@ class TurboCKF(_ValidatedStateMixin):
         Returns:
             ``(xs, Ps, log_likelihoods)`` of shapes ``(N, dim_x)``,
             ``(N, dim_x, dim_x)``, ``(N,)``.
+
+        Raises:
+            ValueError: if any input holds NaN or inf. Missing measurements
+                are not supported here yet; use :meth:`run` with
+                ``nan_means_missing=True`` for sequences with dropouts.
         """
 
         x0_arr = np.ascontiguousarray(np.asarray(x0, dtype=float)).reshape(-1)
@@ -1184,15 +1189,25 @@ class TurboCKF(_ValidatedStateMixin):
 
             ``status[i]`` reports per-filter health:
 
-            * ``0`` — innovation covariance was PD (Cholesky succeeded).
-            * ``1`` — innovation covariance was singular; used the
+            * ``0``: innovation covariance was PD (Cholesky succeeded).
+            * ``1``: innovation covariance was singular; used the
               pseudo-inverse fallback for ``K``. Treat as a soft warning.
-            * ``2`` — no inverse at all; the measurement update was
+            * ``2``: no inverse at all; the measurement update was
               **skipped** and ``log_likelihoods[i] = -inf``. The returned
               ``(xs_new[i], Ps_new[i])`` is the predict-step output only.
+            * ``3``: a filter input held NaN or inf, so the update was
+              **skipped**. If only ``zs[i]`` is non-finite, the returned
+              ``(xs_new[i], Ps_new[i])`` is the predict-step output and
+              ``log_likelihoods[i] = -inf`` (as for ``2``). If ``xs[i]`` or
+              ``Ps[i]`` is non-finite, that filter's inputs are returned
+              unchanged and ``log_likelihoods[i]`` is NaN.
 
-            One bad filter does not abort the bank — Monte-Carlo callers
-            can mask on ``status != 2`` and keep going.
+            One bad filter does not abort the bank. Monte-Carlo callers
+            can mask on ``status < 2`` (update applied) and keep going.
+
+        Raises:
+            ValueError: if the shared ``F``, ``H``, ``Q`` or ``R`` holds a
+                NaN or inf, since every filter would be affected.
         """
 
         xs_arr = np.ascontiguousarray(np.asarray(xs, dtype=float))
@@ -1490,14 +1505,17 @@ class TurboCKF(_ValidatedStateMixin):
 
     @staticmethod
     def _stable_cholesky(cov: Matrix) -> Matrix:
+        # Mirrors the Rust stable_cholesky: jitter is relative to each
+        # diagonal entry (1.0 where that entry is not positive and finite).
         jitter = 0.0
-        eye = np.eye(cov.shape[0], dtype=float)
+        diag = np.diag(cov)
+        scale = np.diag(np.where(np.isfinite(diag) & (diag > 0.0), diag, 1.0))
         for _ in range(6):
             try:
-                return np.linalg.cholesky(cov + jitter * eye)
+                return np.linalg.cholesky(cov + jitter * scale)
             except np.linalg.LinAlgError:
                 jitter = 1e-12 if jitter == 0.0 else jitter * 10.0
-        return np.linalg.cholesky(cov + 1e-6 * eye)
+        return np.linalg.cholesky(cov + 1e-6 * scale)
 
     @staticmethod
     def _validate_standard_model(model_type: str) -> None:
