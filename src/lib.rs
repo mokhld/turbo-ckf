@@ -126,16 +126,18 @@ impl CubatureKalmanFilter {
             return Err(PyValueError::new_err("dt must be finite"));
         }
         let (sigma, jitter) = cubature_points(&self.x, &self.p)?;
-        self.record_jitter(jitter);
         let args = fx_args.unwrap_or_else(|| PyTuple::empty(py));
         let propagated = call_model_vectorized(py, &fx, &sigma, Some(local_dt), args, self.dim_x)?;
+        // Counted only once fx has returned, so a callback that raises
+        // leaves the jitter diagnostics untouched.
+        self.record_jitter(jitter);
 
         let w = 1.0 / (propagated.nrows() as f64);
 
         let mean = row_mean(&propagated, self.dim_x);
-        // tr_mul avoids materializing propagated.transpose().
-        let second_moment = propagated.tr_mul(&propagated) * w;
-        let mut cov = second_moment - &mean * mean.transpose() + &self.q;
+        let dev = centered_rows(propagated, &mean);
+        // tr_mul avoids materializing dev.transpose().
+        let mut cov = dev.tr_mul(&dev) * w + &self.q;
         symmetrize_in_place(&mut cov);
 
         self.x = mean;
@@ -229,15 +231,19 @@ impl CubatureKalmanFilter {
         };
 
         let (sigma, jitter) = cubature_points(&self.x, &self.p)?;
-        self.record_jitter(jitter);
         let args = hx_args.unwrap_or_else(|| PyTuple::empty(py));
         let z_sigma = call_model_vectorized(py, &hx, &sigma, None, args, self.dim_z)?;
+        // Counted only once hx has returned, so a callback that raises
+        // leaves the jitter diagnostics untouched.
+        self.record_jitter(jitter);
 
         let w = 1.0 / (sigma.nrows() as f64);
 
         let z_pred = row_mean(&z_sigma, self.dim_z);
-        let pxz = sigma.tr_mul(&z_sigma) * w - (&self.x * z_pred.transpose());
-        let mut pzz = z_sigma.tr_mul(&z_sigma) * w - &z_pred * z_pred.transpose() + &r_mat;
+        let x_dev = centered_rows(sigma, &self.x);
+        let z_dev = centered_rows(z_sigma, &z_pred);
+        let pxz = x_dev.tr_mul(&z_dev) * w;
+        let mut pzz = z_dev.tr_mul(&z_dev) * w + &r_mat;
         symmetrize_in_place(&mut pzz);
 
         let (si, was_singular) = invert_innovation(&pzz)?;
@@ -317,8 +323,10 @@ impl CubatureKalmanFilter {
         let w = 1.0 / (sigma.nrows() as f64);
 
         let z_pred = row_mean(&z_sigma, self.dim_z);
-        let pxz = sigma.tr_mul(&z_sigma) * w - (&self.x * z_pred.transpose());
-        let mut pzz = z_sigma.tr_mul(&z_sigma) * w - &z_pred * z_pred.transpose() + &r_mat;
+        let x_dev = centered_rows(sigma, &self.x);
+        let z_dev = centered_rows(z_sigma, &z_pred);
+        let pxz = x_dev.tr_mul(&z_dev) * w;
+        let mut pzz = z_dev.tr_mul(&z_dev) * w + &r_mat;
         symmetrize_in_place(&mut pzz);
 
         let (si, was_singular) = invert_innovation(&pzz)?;
@@ -410,8 +418,8 @@ impl CubatureKalmanFilter {
         let w = 1.0 / (propagated.nrows() as f64);
 
         let mean = row_mean(&propagated, self.dim_x);
-        let second_moment = propagated.tr_mul(&propagated) * w;
-        let mut cov = second_moment - &mean * mean.transpose() + &self.q;
+        let dev = centered_rows(propagated, &mean);
+        let mut cov = dev.tr_mul(&dev) * w + &self.q;
         symmetrize_in_place(&mut cov);
 
         self.x = mean;
@@ -428,7 +436,9 @@ impl CubatureKalmanFilter {
     /// a near-zero or negative determinant.
     fn update_likelihood_terms(&mut self) {
         let mahal2 = (self.y.transpose() * &self.si * &self.y)[(0, 0)];
-        self.nis = mahal2.max(0.0);
+        // Clamp round-off negatives to 0 but let NaN through: f64::max would
+        // turn a broken innovation into NIS 0, which passes every gate.
+        self.nis = if mahal2 < 0.0 { 0.0 } else { mahal2 };
         self.mahalanobis = self.nis.sqrt();
 
         if let Some(chol) = self.s.clone().cholesky() {
@@ -672,6 +682,18 @@ fn row_mean(values: &DMatrix<f64>, dim: usize) -> DVector<f64> {
         mean[j] = acc * w;
     }
     mean
+}
+
+/// Subtract `mean` from every row of `values` (M, dim), reusing its buffer.
+/// Cubature moments are built from these deviations: the raw
+/// `E[x x^T] - mean mean^T` form cancels catastrophically when |x| is much
+/// larger than sqrt(P), for example ECEF positions in metres.
+#[inline]
+fn centered_rows(mut values: DMatrix<f64>, mean: &DVector<f64>) -> DMatrix<f64> {
+    for (mut col, m) in values.column_iter_mut().zip(mean.iter()) {
+        col.add_scalar_mut(-m);
+    }
+    values
 }
 
 #[inline]
