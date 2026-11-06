@@ -181,5 +181,68 @@ class DtPropagationTests(unittest.TestCase):
         self.assertAlmostEqual(kf.x[0], 1.0, places=6)
 
 
+def hx_identity(sp):
+    return sp.copy()
+
+
+class StridedMeasurementTests(unittest.TestCase):
+    """A 1-D measurement that is a strided view, such as a column Z[:, k] of a
+    (dim_z, N) array, used to raise TypeError "The given array is not
+    contiguous". It must give the same result as a contiguous copy."""
+
+    def setUp(self):
+        rng = np.random.default_rng(7)
+        self.Z = rng.normal(size=(2, 12))  # column k is one measurement
+        self.assertFalse(self.Z[:, 0].flags.c_contiguous)
+
+    def _pair(self, cls):
+        a = cls(dim_x=2, dim_z=2, dt=0.1, hx=hx_identity, fx=fx)
+        b = cls(dim_x=2, dim_z=2, dt=0.1, hx=hx_identity, fx=fx)
+        return a, b
+
+    def test_ckf_update_strided(self):
+        a, b = self._pair(TurboCKF)
+        for k in range(self.Z.shape[1]):
+            a.predict()
+            a.update(self.Z[:, k])
+            b.predict()
+            b.update(np.ascontiguousarray(self.Z[:, k]))
+        np.testing.assert_array_equal(a.x, b.x)
+        np.testing.assert_array_equal(a.P, b.P)
+
+    def test_srckf_update_strided(self):
+        a, b = self._pair(TurboSRCKF)
+        for k in range(self.Z.shape[1]):
+            a.predict()
+            a.update(self.Z[:, k])
+            b.predict()
+            b.update(np.ascontiguousarray(self.Z[:, k]))
+        np.testing.assert_array_equal(a.x, b.x)
+        np.testing.assert_array_equal(a.P, b.P)
+
+    def test_run_list_of_strided_columns(self):
+        a, b = self._pair(TurboCKF)
+        ra = a.run([self.Z[:, k] for k in range(self.Z.shape[1])])
+        rb = b.run(np.ascontiguousarray(self.Z.T))
+        np.testing.assert_array_equal(ra.xs, rb.xs)
+        np.testing.assert_array_equal(ra.Ps, rb.Ps)
+
+    def test_update_paper_ahrs_strided(self):
+        zs = np.array(
+            [[0.1, 0.2], [-0.05, 0.0], [9.8, 9.7], [40.0, 41.0], [2.0, 1.5], [30.0, 29.0]]
+        )
+        z = zs[:, 0]
+        self.assertFalse(z.flags.c_contiguous)
+        kfs = []
+        for meas in (z, np.ascontiguousarray(z)):
+            kf = TurboCKF(4, 6, 0.01, hx=lambda s: np.zeros((8, 6)), fx=lambda s, dt: s)
+            kf.x = [1.0, 0.0, 0.0, 0.0]
+            kf.P = 1e-2 * np.eye(4)
+            kf.update_paper_ahrs(meas, sigma_acc2=1e-2, sigma_mag2=1e-2)
+            kfs.append(kf)
+        np.testing.assert_array_equal(kfs[0].x, kfs[1].x)
+        np.testing.assert_array_equal(kfs[0].P, kfs[1].P)
+
+
 if __name__ == "__main__":
     unittest.main()
