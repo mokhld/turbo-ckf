@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A 1-D measurement that is a strided view, such as a column `Z[:, k]` of a
+  `(dim_z, N)` array or a row of a Fortran-ordered array, raised
+  `TypeError: The given array is not contiguous`. This hit `update`,
+  `update_paper_ahrs` and `run()` given a list of such vectors, on both
+  `TurboCKF` and `TurboSRCKF`. Strided input now gives the same result as a
+  contiguous copy.
+
 ## [0.9.0] - 2026-09-24
 
 This release fixes eight correctness bugs from a full review of the package and

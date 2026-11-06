@@ -866,8 +866,11 @@ fn pyarray1_to_dvector(
             arr.shape()[0]
         )));
     }
-    let view = arr.as_slice()?;
-    Ok(DVector::from_column_slice(view))
+    // `as_array()` is a strided view, so non-contiguous input works too: a
+    // column `Z[:, k]` of a (dim_z, N) array, or a row of a Fortran-ordered
+    // array. `as_slice()` would reject those with "not contiguous".
+    let view = arr.as_array();
+    Ok(DVector::from_iterator(expected, view.iter().copied()))
 }
 
 fn pyarray2_to_dmatrix(
