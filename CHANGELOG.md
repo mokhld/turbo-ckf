@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-06
+
+A bug-fix release: strided 1-D measurements no longer raise, and the README
+has figures, a "How it works" section and benchmarks re-measured on v0.9.0.
+No numerical results change.
+
 ### Fixed
 - A 1-D measurement that is a strided view, such as a column `Z[:, k]` of a
   `(dim_z, N)` array or a row of a Fortran-ordered array, raised
@@ -440,7 +446,8 @@ Several fixes change numerical results; read "Changed" before upgrading.
 - KCKF-style AHRS update path from Yamagishi and Jing (arXiv:2602.12283).
 - Parity tests against FilterPy and benchmark scripts.
 
-[Unreleased]: https://github.com/mokhld/turbo-ckf/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/mokhld/turbo-ckf/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/mokhld/turbo-ckf/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/mokhld/turbo-ckf/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/mokhld/turbo-ckf/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/mokhld/turbo-ckf/compare/v0.6.0...v0.7.0
