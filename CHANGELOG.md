@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TurboCKF` and `TurboSRCKF`. Strided input now gives the same result as a
   contiguous copy.
 
+### Notes
+- README: new "How it works" section with a cubature point figure, a tracking
+  figure in the introduction, "Differences from FilterPy" (why `P` differs
+  from FilterPy's CKF by `Q`), and "Limitations" (angle residuals, callbacks
+  that use the calling filter). Benchmarks re-measured on v0.9.0: `8.2x` to
+  `13.0x` faster than FilterPy, up from the `3.6x` to `4.4x` of February 2026.
+  Corrected the claim that `TurboSRCKF` never re-factors `P`.
+- `scripts/readme_figures.py` draws the README figures from the library and
+  from a `verify_before_after.py` report saved as `docs/img/benchmark.json`.
+  Needs the new `docs` extra (matplotlib).
+
 ## [0.9.0] - 2026-09-24
 
 This release fixes eight correctness bugs from a full review of the package and

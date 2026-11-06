@@ -7,6 +7,51 @@
 
 `turbo-ckf` is a Rust-backed Cubature Kalman Filter package for high-throughput prediction/update loops. Implemented here purely as an experiment after reading the paper.
 
+It estimates a state you cannot observe directly (a position and velocity, an
+orientation, a clock offset) from noisy measurements. You write the motion
+model `fx` and the measurement model `hx` as vectorized NumPy functions, set
+`x`, `P`, `Q` and `R` as in FilterPy, and call `predict()` and `update(z)`. The
+maths of every step runs in Rust.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/mokhld/turbo-ckf/main/docs/img/tracking-dark.svg">
+  <img alt="Constant-velocity tracker: the estimate's position error is about a third of the raw measurement error, and the unmeasured velocity converges to the true velocity" src="https://raw.githubusercontent.com/mokhld/turbo-ckf/main/docs/img/tracking-light.svg">
+</picture>
+
+A constant-velocity tracker on 300 position readings with 0.5 m noise. The
+position error drops from 0.51 m (raw readings) to 0.18 m, and the velocity,
+which is never measured, is recovered from the motion model. The shaded band is
+the filter's own ±2σ from `P`. Drawn by `scripts/readme_figures.py`.
+
+## How it works
+
+A Kalman filter keeps a Gaussian belief about the state: a mean `x` and a
+covariance `P`. Each step it predicts (pushes the belief through `fx` and adds
+the process noise `Q`) and then updates (compares the measurement with what
+`hx` expects and moves toward it, weighted by how much it trusts each side).
+For linear models this is exact. For a nonlinear `fx` or `hx` the filter needs
+the mean and covariance of a Gaussian after it passes through a nonlinear
+function, which has no closed form.
+
+The cubature Kalman filter (Arasaratnam and Haykin, 2009) approximates them
+with 2n sample points, where n is the state size: the mean plus and minus √n
+times each column of the Cholesky factor of `P`, all with weight 1/(2n). Push
+the points through the model and take their weighted mean and covariance. The
+rule is exact for polynomials up to degree three, has no tuning parameters
+(the UKF has alpha, beta and kappa), and never uses negative weights.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/mokhld/turbo-ckf/main/docs/img/cubature-dark.svg">
+  <img alt="Left: four cubature points around a 2-D Gaussian, placed along the scaled columns of its Cholesky factor. Right: the points pushed through a polar-to-Cartesian conversion, with the cubature mean close to the Monte Carlo mean" src="https://raw.githubusercontent.com/mokhld/turbo-ckf/main/docs/img/cubature-light.svg">
+</picture>
+
+Left: the four points for a 2-D state, captured from inside `fx`, so they are
+exactly what the Rust backend computes. Right: the same rule applied to a
+polar-to-Cartesian conversion with a wide angle uncertainty. The cubature mean
+(y = 0.831) lands close to the mean of 20,000 Monte Carlo samples (y = 0.834).
+Plugging the mean straight into the function, which is how an EKF predicts the
+mean, gives y = 1.0.
+
 ## What This Package Optimizes
 
 - Fast prediction with built-in linear models:
@@ -21,7 +66,7 @@
 
 ## Square-Root Variant
 
-`TurboSRCKF` is a separate estimator that propagates the lower-triangular Cholesky factor of `P` directly. The filter loop never calls `stable_cholesky` on `P`, so the silent diagonal-jitter accumulation `TurboCKF` surfaces via `jitter_count` is structurally impossible in steady state. Use it when `P` becomes ill-conditioned (e.g., long predict chains with tiny `Q`/`R`, or rank-deficient seed covariances). Mirrors `predict(...)` + `update(...)`; for closed-form linear predicts or the AHRS update use `TurboCKF`.
+`TurboSRCKF` is a separate estimator that propagates the lower-triangular Cholesky factor of `P` directly. Predict and update produce the next factor through QR decompositions and rank-1 Cholesky downdates, so in normal operation the loop never re-factors `P` and never adds the diagonal jitter that `TurboCKF` reports in `jitter_count`. The exception is a downdate that fails numerically: the update then rebuilds `P`, re-factors it and increments `downdate_fallback_count` (and `jitter_count` if the re-factor needed jitter). Use it when `P` becomes ill-conditioned (e.g., long predict chains with tiny `Q`/`R`, or rank-deficient seed covariances). Mirrors `predict(...)` + `update(...)`; for closed-form linear predicts or the AHRS update use `TurboCKF`.
 
 ```python
 from turbo_ckf import TurboSRCKF
@@ -40,6 +85,11 @@ Custom `fx` and `hx` must be vectorized:
 - `hx` output shape must be `(2 * dim_x, dim_z)`.
 
 If you pass pointwise callbacks, `TurboCKF` raises immediately.
+
+Callbacks run while Rust holds the filter for the whole step, so they must not
+use the filter that is calling them. Reading an attribute such as `kf.P_prior`
+inside `fx` raises `RuntimeError: Already mutably borrowed`. Pass anything the
+model needs through `fx_args` and `hx_args`.
 
 ## Install
 
@@ -181,6 +231,37 @@ are therefore variances of the unit-vector components, not of the raw readings.
 The filter needs `dim_x=4` (quaternion) and `dim_z=6`, and the update overwrites
 `R` with `diag(sigma_acc2, sigma_acc2, sigma_acc2, sigma_mag2, sigma_mag2, sigma_mag2)`.
 
+## Differences from FilterPy
+
+The API copies FilterPy's attribute names, and the linear paths match FilterPy
+to floating-point precision (`batch_filter` and `rts_smooth` are tested against
+it). Two differences are deliberate:
+
+- `TurboCKF.update` draws a fresh set of cubature points from the predicted `x`
+  and `P`, as in Arasaratnam and Haykin's algorithm. FilterPy's
+  `CubatureKalmanFilter.update` reuses the points it propagated in `predict`,
+  and their spread leaves out `Q`, because `Q` is added to `P` after
+  propagation. With `Q = 0` the two filters agree to about 1e-12. With `Q > 0`
+  they differ: in the 2-state test in `turbo_ckf_tests/test_math.py`,
+  TurboCKF's posterior position variance is smaller than FilterPy's by exactly
+  the `Q` used (1e-3), and the state differs slightly whenever the innovation
+  is not zero.
+- The built-in motion models default to the blocked state layout
+  `[x, y, vx, vy]`; FilterPy code usually uses `[x, vx, y, vy]`. See Usage.
+
+## Limitations
+
+- Angle measurements need care. The update averages the predicted
+  measurements and forms the residual `z - z_pred` with plain arithmetic, and
+  there is no hook for a custom mean or residual function (FilterPy has
+  `z_mean_fn` and `residual_z`). A bearing near ±π breaks the update: a
+  prediction of 3.137 rad and a reading of -3.141 rad give a residual of -6.28
+  instead of about 0. Keep angles away from the seam, or measure
+  `(cos θ, sin θ)` instead of θ.
+- Callbacks cannot use the filter that is calling them (see Callback Contract).
+- Prebuilt wheels cover three platforms; elsewhere `pip` needs a Rust
+  toolchain (see Install).
+
 ## Benchmarks
 
 ### Paper-Reported Targets (Yamagishi and Jing, arXiv:2602.12283)
@@ -192,21 +273,32 @@ These are the KCKF-vs-CKF results reported in the paper:
 
 ### Local Results In This Repo
 
-Measured on **February 21, 2026** on Apple M4 Max, Python 3.12.0, NumPy 2.4.2.
+Measured on **November 6, 2026** (v0.9.0) on Apple M4 Max, Python 3.12.0,
+NumPy 2.4.2, FilterPy 1.4.5.
 
 From:
 
 ```bash
-.venv-turbo-ckf/bin/python turbo_ckf_tests/verify_before_after.py --steps 50000 --repeats 7 --warmup 1 --parity-steps 500
+.venv-turbo-ckf/bin/python turbo_ckf_tests/verify_before_after.py --steps 50000 --repeats 7 --warmup 1 --parity-steps 500 --output docs/img/benchmark.json
 ```
 
-Median runtime per 50k predict+update steps:
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/mokhld/turbo-ckf/main/docs/img/benchmark-dark.svg">
+  <img alt="Time per predict and update step: FilterPy 44.3 microseconds, TurboCKF with Python callbacks 5.4, TurboCKF built-in models 3.4 and 3.5" src="https://raw.githubusercontent.com/mokhld/turbo-ckf/main/docs/img/benchmark-light.svg">
+</picture>
 
-- FilterPy (`filterpy_predict_update`): `2.354375 s` (baseline)
-- TurboCKF callback path (`turbo_callback_predict_update`): `0.662003 s` (`3.56x` vs FilterPy)
-- TurboCKF standard model KCKF (`turbo_standard_model_predict_update`): `0.539281 s` (`4.37x` vs FilterPy)
-- TurboCKF standard model CKF (`turbo_standard_model_ckf_predict_update`): `0.549905 s` (`4.28x` vs FilterPy)
-- KCKF-vs-CKF full-step speedup in this setup: `1.02x` (`0.549905 / 0.539281`)
+Median runtime per 50k predict+update steps of a 2-state constant-velocity
+filter:
+
+| Loop | Total | Per step | vs FilterPy |
+| --- | --- | --- | --- |
+| FilterPy `CubatureKalmanFilter` (`filterpy_predict_update`) | 2.217 s | 44.3 us | baseline |
+| TurboCKF callback path (`turbo_callback_predict_update`) | 0.272 s | 5.4 us | 8.2x |
+| TurboCKF standard model KCKF (`turbo_standard_model_predict_update`) | 0.171 s | 3.4 us | 13.0x |
+| TurboCKF standard model CKF (`turbo_standard_model_ckf_predict_update`) | 0.173 s | 3.5 us | 12.9x |
+
+The full report, with every sample, is `docs/img/benchmark.json`;
+`scripts/readme_figures.py` draws the chart from it.
 
 From:
 
@@ -214,14 +306,21 @@ From:
 .venv-turbo-ckf/bin/python turbo_ckf_tests/benchmark_paper.py
 ```
 
-- KCKF-vs-CKF (prediction only, backend): `1.67x`
-- KCKF-vs-CKF (full step, backend): `1.09x`
-- KCKF-vs-CKF (full step, wrapper): `1.03x`
+KCKF against CKF, range over five runs:
+
+- Prediction only, backend: `1.24x` to `1.31x`
+- Full step, backend: `0.96x` to `1.05x`
+- Full step, through the Python wrapper: `0.93x` to `1.09x`
 
 Interpretation:
 
-- The largest gains here are from the Rust-backed implementation versus pure-Python FilterPy loops (`~3.5x` to `~4.4x` in these runs).
-- The direct KCKF-vs-CKF algorithmic gain is present but smaller on full-step end-to-end runs, and larger when isolating prediction equations.
+- Most of the speed comes from running the filter in Rust instead of
+  pure-Python FilterPy loops (`8.2x` to `13.0x` here). The February 2026 run
+  measured `3.6x` to `4.4x`; v0.9.0 keeps the filter state in Rust, which
+  removed most of the per-call copying.
+- The paper's simplified prediction (KCKF) is about `1.3x` faster than the
+  standard CKF prediction on its own. Over a full predict+update step the
+  difference is within run-to-run noise on this machine.
 
 ## Research Basis
 

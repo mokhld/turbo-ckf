@@ -6,6 +6,7 @@
 | ---- | ------ | ------- | ----- |
 | 2026-09-24 | 807ec67 | 0.8.0 | First full review. All of `src/lib.rs`, `turbo_ckf/*.py`, README, CHANGELOG, CI/release workflows. Findings verified by running code on macOS arm64, Python 3.12.0, NumPy 2.4.2, FilterPy 1.4.5. |
 | 2026-09-24 | 807ec67..#25 | 0.9.0 | Fix pass, same day. Parallel agents fixed A1-A8 and most lower-priority items and built B1, in PRs #20-#25. Each fix was re-verified against the original repro before merge. A8 was found during the pass. |
+| 2026-11-06 | e11e8a3 | 0.9.0 | Follow-up read-through of the whole repo while writing a study guide. Explained the FilterPy `P` gap, found and fixed strided 1-D measurements being rejected, found two undocumented limitations (angle residuals, callbacks re-entering the filter) and stale README benchmarks. Items added under "Lower-priority issues". |
 
 No earlier review file existed. An internal `AUDIT.md` was referenced before commit
 0331709 but was never committed, so there was nothing to build on.
@@ -314,7 +315,36 @@ code in this review; "inferred" means read from code or docs but not executed.
   from FilterPy's by a steady 1.000e-3, exactly the Q used, both before and after the
   PR #24 centring change. That is why that test uses a 1.1e-3 P tolerance. It may be a
   convention difference in where Q enters (prior vs posterior comparison) rather than a
-  bug. Status: open; worth a look before claiming FilterPy parity for P.
+  bug. Status: explained 2026-11-06, not a bug. FilterPy's
+  `CubatureKalmanFilter.update` evaluates `hx` on `sigmas_f`, the points it
+  propagated in `predict`, and builds `Pxz` from them; their spread is
+  `P^- - Q` because `Q` is added after propagation. `TurboCKF` redraws points
+  from `(x^-, P^-)` in `update` (`lib.rs` ~L266), the Arasaratnam-Haykin form,
+  so its `S` and `Pxz` include `Q`. With `Q = 0` the two agree to ~1e-12. The
+  README has a "Differences from FilterPy" section; the 1.1e-3 tolerance in
+  `test_math.py` can stay.
+- Found 2026-11-06: a 1-D measurement that is a strided view (`Z[:, k]` of a
+  `(dim_z, N)` array, or a row of a Fortran-ordered array) raised
+  `TypeError: The given array is not contiguous` in `update`,
+  `update_paper_ahrs` and `run()` with a list of rows, on both filters.
+  `_as_vector` keeps the view and `pyarray1_to_dvector` called `as_slice()`.
+  Status: fixed on branch `docs/readme-refresh` (`as_array()` plus
+  `DVector::from_iterator`); regression tests in `test_user_api.py`.
+- Found 2026-11-06: no angle-aware measurement mean or residual. The update
+  averages predicted measurements and forms `z - z_pred` with plain
+  arithmetic, so bearings near +-pi break it (predicted 3.137, measured
+  -3.141 gives a residual of -6.28). FilterPy has `z_mean_fn` and
+  `residual_z`. Status: open, documented in README "Limitations"; a residual
+  hook would fit with B6 (FilterPy migration helpers).
+- Found 2026-11-06: an `fx`/`hx` that reads an uncached attribute of the
+  calling filter (for example `kf.P_prior`) raises `RuntimeError: Already
+  mutably borrowed`, because Rust holds `&mut self` for the whole step.
+  Status: open by design, documented in README "Callback Contract".
+- Found 2026-11-06: README benchmarks were from February 2026, before B1
+  (state in Rust), and showed 3.6x to 4.4x vs FilterPy; v0.9.0 measures 8.2x
+  to 13.0x. The README also said `TurboSRCKF` never re-factors `P`, which the
+  downdate fallback does. Status: fixed on branch `docs/readme-refresh`, with
+  figures from `scripts/readme_figures.py`.
 - Behavior note from PR #25: `TurboSRCKF` now counts seed-time jitter (assigning a
   degenerate P, or Q = 0) in `jitter_count`, so a fresh filter can report
   `jitter_count == 1` before any step. Call `reset_jitter_counters()` after seeding if

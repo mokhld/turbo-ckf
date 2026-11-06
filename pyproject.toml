@@ -39,6 +39,10 @@ dev = [
   "pytest-cov",
   "maturin",
 ]
+# scripts/readme_figures.py only
+docs = [
+  "matplotlib",
+]
 
 [project.urls]
 Homepage = "https://github.com/mokhld/turbo-ckf"
