@@ -2,7 +2,7 @@
 
 ## What this package is
 
-`turbo-ckf` (PyPI `turbo-ckf`, v0.9.0, alpha) is a Cubature Kalman Filter for Python
+`turbo-ckf` (PyPI `turbo-ckf`, v0.9.1, alpha) is a Cubature Kalman Filter for Python
 whose math runs in a Rust extension (PyO3 0.20, rust-numpy 0.20, nalgebra 0.32, rayon).
 The API is FilterPy-shaped: set `x`, `P`, `Q`, `R`, call `predict()` / `update(z)`. It
 also implements the KCKF AHRS equations from Yamagishi and Jing, arXiv:2602.12283
